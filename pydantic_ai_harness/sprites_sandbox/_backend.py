@@ -546,8 +546,9 @@ def _ending_with(marker: str, capture: str, args: list[str]) -> list[str]:
     stream in one run and on the stdout stream in the next, whole lines included (2026-09-25), while
     stdout arrived intact every time. So the command's stderr goes to a temporary file in the Sprite,
     printed on stdout after the marker line, and `_split_output` separates the two again. The file is
-    unlinked as soon as it is open, so a command stopped by a timeout or a cancellation leaves no
-    stderr behind for a later command to read. The exit status is the command's.
+    removed when the command finishes; one stopped by a timeout or a cancellation can leave it in
+    `/tmp`, but every command gets a fresh name, so no later command reads it. The exit status is the
+    command's.
     """
     script = (
         'cat >/dev/null; err=$1; shift; : >"$err" || exit 125; '

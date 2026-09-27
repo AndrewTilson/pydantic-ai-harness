@@ -30,7 +30,7 @@ agent = Agent('anthropic:claude-opus-5-5', capabilities=[SpritesSandbox(), Coder
 result = agent.run_sync('Clone https://github.com/pydantic/pydantic-ai and summarize how capabilities work.')
 ```
 
-`Coder`'s shell and file tools now run in a Sprite, not on your machine. The Sprite is created the first time a tool uses it. It has no lifetime limit: it sleeps when idle and keeps its files, and costs money, until you delete it; see [Clean up](#clean-up).
+`Coder`'s shell and file tools now run in a Sprite, not on your machine. With `Coder`, `RepoContext` creates the Sprite when the run starts, even without a tool call; use `Coder(repo_context=False)` for lazy creation. It has no lifetime limit: it sleeps when idle and keeps its files, and costs money, until you delete it; see [Clean up](#clean-up).
 
 A new Sprite comes with git, Python, and Node.js ([preinstalled tools](https://docs.fly.io/sprites/working-with-sprites/)). Ripgrep (`rg`) is not preinstalled. For faster `Coder` searches, run `sudo apt-get update && sudo apt-get install ripgrep` once in the Sprite and store its ref to reuse it on later runs. Sprites retain installed packages.
 
