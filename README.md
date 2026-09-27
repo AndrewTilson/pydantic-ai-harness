@@ -1,5 +1,11 @@
 # Pydantic AI Harness
 
+> [!WARNING]
+> **This repository is being merged into [Pydantic AI](https://github.com/pydantic/pydantic-ai) and will be archived.**
+> `pydantic-ai-harness` and `pydantic-clai2` are now developed there, in [`src/pydantic_ai_harness`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness) and [`src/pydantic_clai2`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_clai2), with their full history.
+> Please open new issues and pull requests on [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai/issues).
+> The PyPI package names stay the same, and future releases will be published from Pydantic AI.
+
 [![CI](https://github.com/pydantic/pydantic-ai-harness/actions/workflows/main.yml/badge.svg?event=push)](https://github.com/pydantic/pydantic-ai-harness/actions/workflows/main.yml?query=branch%3Amain)
 [![PyPI](https://img.shields.io/pypi/v/pydantic-ai-harness.svg)](https://pypi.python.org/pypi/pydantic-ai-harness)
 [![versions](https://img.shields.io/pypi/pyversions/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness)
