@@ -33,7 +33,7 @@ agent = Agent('anthropic:claude-opus-5-5', capabilities=[DaytonaSandbox(), Coder
 result = agent.run_sync('Clone https://github.com/pydantic/pydantic-ai and summarize how capabilities work.')
 ```
 
-`Coder`'s shell and file tools now run in the sandbox, not on your machine. The sandbox is created the first time a tool uses it, and it keeps running, and billing, after the run ends; see [Clean up](#clean-up).
+`Coder`'s shell and file tools now run in the sandbox, not on your machine. With `Coder`, `RepoContext` creates the sandbox when the run starts, even without a tool call; use `Coder(repo_context=False)` for lazy creation. It keeps running, and billing, after the run ends; see [Clean up](#clean-up).
 
 Daytona's default snapshot includes Python and `git`. `Coder` searches with ripgrep (`rg`) when the sandbox has it and with its built-in search otherwise; installing it in a snapshot of your own (`snapshot=`) makes searches faster. A snapshot Daytona doesn't know fails on first use with a clear error.
 
