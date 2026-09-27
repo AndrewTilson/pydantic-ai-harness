@@ -11,14 +11,18 @@ from uuid import uuid4
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import LocalWorkspace
-from pydantic_ai.durable_exec.temporal import PydanticAIPlugin, PydanticAIWorkflow, TemporalDurability
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
-from temporalio import workflow
-from temporalio.client import Client
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
-from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+
+try:
+    from pydantic_ai.durable_exec.temporal import PydanticAIPlugin, PydanticAIWorkflow, TemporalDurability
+    from temporalio import workflow
+    from temporalio.client import Client
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+    from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+except ImportError:  # pragma: lax no cover
+    pytest.skip('temporalio not installed', allow_module_level=True)
 
 from pydantic_ai_harness.shell import Shell
 
