@@ -40,8 +40,14 @@ def anyio_backend() -> str:
 def prefect_server() -> Generator[None, None, None]:
     # Prefect is an optional core extra; its absence must not hide the DBOS cells.
     pytest.importorskip('prefect')
-    from prefect.settings import PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_ENABLED, temporary_settings  # noqa: PLC0415
-    from prefect.testing.utilities import prefect_test_harness  # noqa: PLC0415
+    # Lint type-checks without Prefect installed, so its imports are unresolved there.
+    from prefect.settings import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_ENABLED,  # pyright: ignore[reportUnknownVariableType]
+        temporary_settings,  # pyright: ignore[reportUnknownVariableType]
+    )
+    from prefect.testing.utilities import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        prefect_test_harness,  # pyright: ignore[reportUnknownVariableType]
+    )
 
     with temporary_settings({PREFECT_SERVER_SERVICES_TASK_RUN_RECORDER_ENABLED: False}):
         with prefect_test_harness(server_startup_timeout=120):
@@ -119,13 +125,13 @@ def _agent(root: Path, engine: str, capability: str, vetoes: list[str]) -> Agent
 @pytest.mark.anyio
 @pytest.mark.parametrize('capability', ['coder', 'shell', 'filesystem'])
 async def test_prefect_workspace_capabilities(tmp_path: Path, prefect_server: None, capability: str) -> None:
-    from prefect import flow  # noqa: PLC0415
+    from prefect import flow  # noqa: PLC0415  # pyright: ignore[reportMissingImports,reportUnknownVariableType]
 
     (tmp_path / 'dir').mkdir()
     vetoes: list[str] = []
     agent = _agent(tmp_path, 'prefect', capability, vetoes)
 
-    @flow
+    @flow  # pyright: ignore[reportUntypedFunctionDecorator]
     async def run() -> list[str]:
         result = await agent.run('go')
         assert result.output == 'done'
