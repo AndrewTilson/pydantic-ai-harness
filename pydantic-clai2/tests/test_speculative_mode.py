@@ -506,11 +506,12 @@ class TestSandboxCallDisplay:
         finished = [event.result for event in reports if isinstance(event, SandboxCallFinishedEvent)]
         assert [call.tool_call_id for call in started] == [result.tool_call_id for result in finished]
         assert all(re.fullmatch(r'.+__\d+', call.tool_call_id) for call in started)
-        # A failed speculative launch is still claimed and shown, like a cold failure.
+        # A missing file is a plain result, not a retry; failed speculative launches are
+        # still claimed and shown, like cold failures.
         assert [type(result).__name__ for result in finished] == [
             'ToolReturnPart',
             'ToolReturnPart',
-            'RetryPromptPart',
+            'ToolReturnPart',
             'RetryPromptPart',
             'RetryPromptPart',
         ]
