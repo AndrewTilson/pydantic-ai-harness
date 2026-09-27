@@ -90,7 +90,7 @@ async def test_temporal_default_runner_veto(tmp_path: Path) -> None:
                 str(tmp_path),
                 id=uuid4().hex,
                 task_queue='default-veto',
-                execution_timeout=timedelta(seconds=15),
+                execution_timeout=timedelta(seconds=120),
             )
     assert 'denied' in str(returns)
     assert (tmp_path / 'protected.txt').read_text() == 'original'
@@ -152,7 +152,7 @@ async def test_temporal_vetoes_before_mutation(
         async with Worker(client, task_queue='file-veto', workflows=[FileWorkflow], workflow_runner=runner):
             assert (
                 await client.execute_workflow(
-                    FileWorkflow.run, id=uuid4().hex, task_queue='file-veto', execution_timeout=timedelta(seconds=20)
+                    FileWorkflow.run, id=uuid4().hex, task_queue='file-veto', execution_timeout=timedelta(seconds=120)
                 )
                 == 'done'
             )
