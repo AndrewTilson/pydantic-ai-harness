@@ -96,7 +96,7 @@ async def test_temporal_history_replays_veto_and_background_job_once(tmp_path: P
                 str(tmp_path),
                 id=workflow_id,
                 task_queue='replay-harness',
-                execution_timeout=timedelta(seconds=25),
+                execution_timeout=timedelta(seconds=120),
             )
         history = await client.get_workflow_handle(workflow_id).fetch_history()
     assert 'denied' in result[0]

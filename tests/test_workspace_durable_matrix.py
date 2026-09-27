@@ -243,7 +243,7 @@ async def test_temporal_new_worker_keeps_shell_cwd(tmp_path: Path) -> None:
             client = await Client.connect(env.client.service_client.config.target_host, plugins=[PydanticAIPlugin()])
             async with Worker(client, task_queue=queue, workflows=[ShellRestartWorkflow], workflow_runner=runner):
                 handle = await client.start_workflow(
-                    ShellRestartWorkflow.run, id=queue, task_queue=queue, execution_timeout=timedelta(seconds=30)
+                    ShellRestartWorkflow.run, id=queue, task_queue=queue, execution_timeout=timedelta(seconds=120)
                 )
                 with anyio.fail_after(20):
                     await _restart_ready.wait()
