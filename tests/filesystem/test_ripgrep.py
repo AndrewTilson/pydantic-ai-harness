@@ -294,8 +294,8 @@ class TestWithoutRipgrep:
     """A workspace without `rg` uses the in-workspace POSIX search tools."""
 
     @pytest.fixture
-    def without_rg(self, workspace: Path) -> LocalWorkspaceBackend:
-        return LocalWorkspaceBackend(workspace, env={'PATH': '/usr/bin:/bin'})
+    def without_rg(self, workspace: Path, no_rg_path: str) -> LocalWorkspaceBackend:
+        return LocalWorkspaceBackend(workspace, env={'PATH': no_rg_path})
 
     async def test_list_files(self, workspace: Path, without_rg: LocalWorkspaceBackend) -> None:
         ts = toolset(workspace)
@@ -313,8 +313,8 @@ class TestWithoutRipgrep:
         with pytest.raises(ModelRetry, match='`file_type` needs ripgrep'):
             await ts.grep('os', file_type='py', workspace=without_rg)
 
-    async def test_missing_rg_is_probed_once_per_workspace(self, workspace: Path) -> None:
-        backend = _CountingProbes(workspace, env={'PATH': '/usr/bin:/bin'})
+    async def test_missing_rg_is_probed_once_per_workspace(self, workspace: Path, no_rg_path: str) -> None:
+        backend = _CountingProbes(workspace, env={'PATH': no_rg_path})
         ts, ws = toolset(workspace), Workspace(backend)
         await ts.grep('os', workspace=ws)
         await ts.list_files(workspace=ws)

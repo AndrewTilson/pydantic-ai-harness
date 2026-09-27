@@ -14,8 +14,8 @@ pytestmark = pytest.mark.anyio
 
 
 class CountingBackend(LocalWorkspaceBackend):
-    def __init__(self, root: Path) -> None:
-        super().__init__(root, env={'PATH': '/usr/bin:/bin'})
+    def __init__(self, root: Path, path: str) -> None:
+        super().__init__(root, env={'PATH': path})
         self.commands = 0
         self.reads = 0
         self.realpaths = 0
@@ -41,7 +41,7 @@ class CountingBackend(LocalWorkspaceBackend):
         return await super().read_bytes(path)
 
 
-async def test_no_rg_uses_one_command_and_preserves_ignores(tmp_path: Path) -> None:
+async def test_no_rg_uses_one_command_and_preserves_ignores(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'src').mkdir()
     (tmp_path / 'src' / 'visible.py').write_text('needle\n')
     (tmp_path / 'ignored').mkdir()
@@ -49,7 +49,7 @@ async def test_no_rg_uses_one_command_and_preserves_ignores(tmp_path: Path) -> N
     (tmp_path / '.gitignore').write_text('ignored/\n')
     (tmp_path / '.hidden.py').write_text('needle\n')
     subprocess.run(['git', '-C', str(tmp_path), 'init', '-q'], check=True)
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     workspace = Workspace(backend)
     tools = FileSystem[None](tools=['grep', 'list_files']).get_toolset()
     assert isinstance(tools, FileSystemToolset)
@@ -61,7 +61,7 @@ async def test_no_rg_uses_one_command_and_preserves_ignores(tmp_path: Path) -> N
     assert backend.reads == 0
 
 
-async def test_no_rg_search_files_is_one_command_and_confines_symlinks(tmp_path: Path) -> None:
+async def test_no_rg_search_files_is_one_command_and_confines_symlinks(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'safe.txt').write_text('needle\n')
     (tmp_path / 'secret.txt').write_text('needle\n')
     (tmp_path / 'alias.txt').symlink_to('secret.txt')
@@ -69,7 +69,7 @@ async def test_no_rg_search_files_is_one_command_and_confines_symlinks(tmp_path:
     outside.write_text('needle\n')
     try:
         (tmp_path / 'escape.txt').symlink_to(outside)
-        backend = CountingBackend(tmp_path)
+        backend = CountingBackend(tmp_path, no_rg_path)
         tools = FileSystem[None](root_dir=tmp_path, denied_patterns=['secret.txt']).get_toolset()
         assert isinstance(tools, FileSystemToolset)
         workspace = Workspace(backend)
@@ -86,10 +86,10 @@ async def test_no_rg_search_files_is_one_command_and_confines_symlinks(tmp_path:
         outside.unlink()
 
 
-async def test_many_search_results_use_batched_path_checks(tmp_path: Path) -> None:
+async def test_many_search_results_use_batched_path_checks(tmp_path: Path, no_rg_path: str) -> None:
     for index in range(20):
         (tmp_path / f'{index:02}.txt').write_text('needle\n')
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path, max_search_results=25, max_find_results=25).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     await tools.search_files('absent', workspace=backend)
@@ -105,10 +105,10 @@ async def test_many_search_results_use_batched_path_checks(tmp_path: Path) -> No
         assert backend.realpaths <= 2
 
 
-async def test_large_listing_checks_paths_in_search_command(tmp_path: Path) -> None:
+async def test_large_listing_checks_paths_in_search_command(tmp_path: Path, no_rg_path: str) -> None:
     for index in range(600):
         (tmp_path / f'{index:03}.txt').write_text('needle\n')
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path, max_find_results=600).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     assert len((await tools.list_files(workspace=backend)).splitlines()) == 600
@@ -116,9 +116,9 @@ async def test_large_listing_checks_paths_in_search_command(tmp_path: Path) -> N
     assert backend.reads == 0
 
 
-async def test_first_search_files_uses_command_not_walker(tmp_path: Path) -> None:
+async def test_first_search_files_uses_command_not_walker(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'visible.txt').write_text('needle\n')
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     assert await tools.search_files('needle', workspace=backend) == 'visible.txt:1:needle'
@@ -126,11 +126,11 @@ async def test_first_search_files_uses_command_not_walker(tmp_path: Path) -> Non
     assert backend.reads == 0
 
 
-async def test_no_rg_ignore_and_failure_are_not_silent(tmp_path: Path) -> None:
+async def test_no_rg_ignore_and_failure_are_not_silent(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'visible.txt').write_text('needle\n')
     (tmp_path / 'hidden.txt').write_text('needle\n')
     (tmp_path / '.ignore').write_text('hidden.txt\n')
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     workspace = Workspace(backend)
@@ -166,33 +166,33 @@ async def test_recursive_find_reports_hidden_omissions(tmp_path: Path) -> None:
     assert 'src/visible.txt' in result
 
 
-async def test_nested_gitignore_on_posix_search(tmp_path: Path) -> None:
+async def test_nested_gitignore_on_posix_search(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'src').mkdir()
     (tmp_path / 'src' / '.gitignore').write_text('ignored.txt\n')
     (tmp_path / 'src' / 'ignored.txt').write_text('needle\n')
     (tmp_path / 'src' / 'visible.txt').write_text('needle\n')
     subprocess.run(['git', '-C', str(tmp_path), 'init', '-q'], check=True)
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     assert await tools.search_files('needle', workspace=backend) == 'src/visible.txt:1:needle'
     assert backend.reads == 0
 
 
-async def test_posix_grep_explicit_ignored_file(tmp_path: Path) -> None:
+async def test_posix_grep_explicit_ignored_file(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / '.gitignore').write_text('ignored.txt\n')
     (tmp_path / 'ignored.txt').write_text('needle\n')
     subprocess.run(['git', '-C', str(tmp_path), 'init', '-q'], check=True)
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path, tools=['grep']).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     assert await tools.grep('needle', workspace=backend) == 'No matches found.'
     assert await tools.grep('needle', path='ignored.txt', workspace=backend) == 'ignored.txt:1:needle'
 
 
-async def test_posix_output_cap_reports_truncation(tmp_path: Path) -> None:
+async def test_posix_output_cap_reports_truncation(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'many.txt').write_text(('needle ' + 'X' * 100 + '\n') * 85000)
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path, max_search_results=200000, tools=['grep']).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     result = await tools.grep('needle', workspace=backend)
@@ -200,9 +200,9 @@ async def test_posix_output_cap_reports_truncation(tmp_path: Path) -> None:
     assert 'truncated' in result
 
 
-async def test_no_rg_rejects_unsupported_regex(tmp_path: Path) -> None:
+async def test_no_rg_rejects_unsupported_regex(tmp_path: Path, no_rg_path: str) -> None:
     (tmp_path / 'file.txt').write_text('needle\n')
-    backend = CountingBackend(tmp_path)
+    backend = CountingBackend(tmp_path, no_rg_path)
     tools = FileSystem[None](root_dir=tmp_path, tools=['grep']).get_toolset()
     assert isinstance(tools, FileSystemToolset)
     with pytest.raises((ModelRetry, ValueError), match='ripgrep|POSIX|unsupported'):
