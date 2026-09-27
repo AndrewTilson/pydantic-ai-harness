@@ -11,6 +11,7 @@ from pydantic_ai_harness.filesystem import FileSystemToolset
 pytestmark = [pytest.mark.anyio, pytest.mark.e2b_live]
 
 
+@pytest.mark.parametrize('anyio_backend', ['asyncio'])  # the E2B SDK needs asyncio
 async def test_default_e2b_search_without_ripgrep() -> None:
     pytest.importorskip('e2b')
     if not os.getenv('E2B_API_KEY'):
