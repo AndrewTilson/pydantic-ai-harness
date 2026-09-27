@@ -33,7 +33,7 @@ agent = Agent('anthropic:claude-opus-5-5', capabilities=[E2BSandbox(), Coder()])
 result = agent.run_sync('Clone https://github.com/pydantic/pydantic-ai and summarize how capabilities work.')
 ```
 
-`Coder`'s shell and file tools now run in the sandbox, not on your machine. The sandbox is created the first time a tool uses it, and it keeps running, and billing, after the run ends; see [Clean up](#clean-up).
+`Coder`'s shell and file tools now run in the sandbox, not on your machine. With `Coder`, `RepoContext` creates the sandbox when the run starts, even without a tool call; use `Coder(repo_context=False)` for lazy creation. It keeps running, and billing, after the run ends; see [Clean up](#clean-up).
 
 A sandbox lives for 1 hour by default. When that runs out it pauses, and the next run resumes it. On E2B's Pro plan you can pass up to `E2BSandbox(sandbox_timeout=86400)`. A plan-limit hint is added only when E2B rejects the requested lifetime; other create errors, including network timeouts, retain the upstream error.
 
