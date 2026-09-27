@@ -19,7 +19,7 @@ async def test_default_e2b_search_without_ripgrep() -> None:
 
     backend = E2BSandboxBackend(sandbox_timeout=300)
     try:
-        await backend.get_client()
+        await backend.get_sandbox()
         await backend.write_bytes('/home/user/search-proof.txt', b'proof-marker\n')
         tools = FileSystemToolset(
             root_dir=None,

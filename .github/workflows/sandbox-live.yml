@@ -88,7 +88,8 @@ jobs:
           enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
           cache-suffix: sandbox-${{ matrix.provider }}
 
-      - run: uv sync --locked --group dev --extra "$PROVIDER"
+      # Each provider's guide has a Temporal worker example, which the docs-example test runs.
+      - run: uv sync --locked --group dev --extra "$PROVIDER" --extra temporal
         env:
           PROVIDER: ${{ matrix.provider }}
 
