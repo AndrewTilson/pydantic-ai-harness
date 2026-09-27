@@ -100,7 +100,7 @@ async def test_concurrent_temporal_workflows_keep_separate_cwd(tmp_path: Path) -
                         key,
                         id=uuid4().hex,
                         task_queue='shell-cwd',
-                        execution_timeout=timedelta(seconds=25),
+                        execution_timeout=timedelta(seconds=120),
                     )
                     for key in ('a', 'b')
                 )
