@@ -307,7 +307,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
         id: str | None = None,
         description: str | None = None,
         defer_loading: bool = False,
-        **unsupported: Any,
+        **unsupported: object,
     ) -> ModalSandbox[Any]:
         """Build from an agent spec, covering the fields a spec can express.
 

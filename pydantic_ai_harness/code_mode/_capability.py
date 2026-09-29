@@ -378,11 +378,14 @@ class CodeMode(AbstractCapability[AgentDepsT]):
         max_tool_calls: int = 100,
         mount: CodeModeMountSpec | Sequence[CodeModeMountSpec] | None = None,
         resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None,
+        eager: bool = False,
+        speculate: Sequence[str] | Literal['declared'] | None = None,
+        monty_sandbox_url: str | None = None,
         dynamic_catalog: bool = False,
         id: str | None = None,
         description: str | None = None,
         defer_loading: bool = False,
-        **unsupported: Any,
+        **unsupported: object,
     ) -> CodeMode[Any]:
         """Build from an agent spec, covering the fields a spec can express.
 
@@ -409,6 +412,9 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             max_tool_calls=max_tool_calls,
             mount=_mount_from_spec(mount),
             resource_limits=resource_limits,
+            eager=eager,
+            speculate=speculate,
+            monty_sandbox_url=monty_sandbox_url,
             dynamic_catalog=dynamic_catalog,
             id=id,
             description=description,

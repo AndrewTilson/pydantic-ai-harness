@@ -8,6 +8,7 @@ instances, and rejects `os_access` by name.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,20 @@ class TestSchema:
             'max_tool_calls',
             'mount',
             'resource_limits',
+            'eager',
+            'speculate',
+            'monty_sandbox_url',
             'dynamic_catalog',
             'id',
             'description',
             'defer_loading',
         } <= set(params)
         assert 'os_access' not in params
+
+    def test_from_spec_names_every_constructor_field_but_os_access(self) -> None:
+        init_params = set(inspect.signature(CodeMode.__init__).parameters) - {'self'}
+        spec_params = set(inspect.signature(CodeMode.from_spec).parameters) - {'unsupported'}
+        assert init_params - spec_params == {'os_access'}
 
     def test_mounts_are_published_as_their_spec_shape(self) -> None:
         schema = AgentSpec.model_json_schema_with_capabilities([CodeMode])
@@ -57,6 +66,9 @@ class TestFromSpec:
             max_retries=1,
             max_tool_calls=7,
             resource_limits={'max_duration_secs': 5.0},
+            eager=True,
+            speculate='declared',
+            monty_sandbox_url='wss://monty.example/ws',
             dynamic_catalog=True,
             id='cm',
             description='sandboxed tools',
@@ -66,6 +78,9 @@ class TestFromSpec:
         assert capability.max_retries == 1
         assert capability.max_tool_calls == 7
         assert capability.resource_limits == {'max_duration_secs': 5.0}
+        assert capability.eager is True
+        assert capability.speculate == 'declared'
+        assert capability.monty_sandbox_url == 'wss://monty.example/ws'
         assert capability.dynamic_catalog is True
         assert capability.id == 'cm'
         assert capability.description == 'sandboxed tools'
