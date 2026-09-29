@@ -226,8 +226,9 @@ class EagerCoordinator(Generic[AgentDepsT]):
         # Parsing only that suffix keeps each scan proportional to what is still open.
         unfed = '\n'.join(lines[call.fed_line_count :])
 
+        scan_start = call.fed_line_count
         for statement in closed_statements(unfed):
-            end = call.fed_line_count + (statement.end_lineno or statement.lineno)
+            end = scan_start + (statement.end_lineno or statement.lineno)
             call.queue.append('\n'.join(lines[call.fed_line_count : end]))
             call.fed_line_count = end
         call.fed_prefix = '\n'.join(lines[: call.fed_line_count])
@@ -334,7 +335,7 @@ class EagerCodeModeToolset(CodeModeToolset[AgentDepsT]):
             await self.execution.discard(call)
             run_state = self._run_state
             assert run_state is not None, '`CodeModeToolset` must be entered before calling `run_code`'
-            run_state.reset()
+            await run_state.reset()
             raise ModelRetry(
                 'The submitted code no longer matches the prefix eager execution already ran, '
                 'so the session was restarted. Send the snippet again.'
