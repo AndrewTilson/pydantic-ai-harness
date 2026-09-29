@@ -26,7 +26,6 @@ from pydantic_ai_harness.code_mode._toolset import (
     CodeModeOS,
     CodeModeResourceLimits,
     CodeModeToolset,
-    MountDir,
     as_os_handler,
     in_durable_execution,
 )
@@ -71,6 +70,9 @@ def _mount_from_spec(mount: CodeModeMountSpec | Sequence[CodeModeMountSpec] | No
     """
     if mount is None:
         return None
+    # Deferred so a missing `pydantic-monty` still fails through `_toolset`'s install hint.
+    from pydantic_monty import MountDir
+
     entries = cast(Sequence[object], mount if isinstance(mount, Sequence) else [mount])
     allowed_keys = CodeModeMountSpec.__annotations__.keys()
     for entry in entries:
