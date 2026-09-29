@@ -13,7 +13,6 @@ from uuid import uuid4
 from pydantic_ai import CallToolsNode, ModelRequestNode
 from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.capabilities.abstract import AgentNode, NodeResult, WrapRunHandler
-from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.run import AgentRunResult
@@ -162,10 +161,10 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
         run_id: str | None = None,
         parent_run_id: str | None = None,
         metadata: dict[str, str] | None = None,
-        id: str | None = None,
+        capture_frontier: bool = False,
+        id: str | None = 'step_persistence',
         description: str | None = None,
         defer_loading: bool = False,
-        **unsupported: Any,
     ) -> StepPersistence[Any]:
         """Construct from a serialised spec.
 
@@ -189,19 +188,9 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
         the constructed store to bound per-run snapshot growth.
 
         `store` is runtime-only: a live `StepStore` has no spec
-        representation, so it is rejected with a pointer to Python
-        construction rather than dropped. `**unsupported` keeps that
-        rejection specific for any other unknown field; core drops it from
-        the schema, so it costs nothing there.
+        representation, so it is not a parameter here and passing it raises
+        `TypeError` like any other unknown field.
         """
-        if 'store' in unsupported:
-            raise UserError(
-                'StepPersistence `store` is runtime-only and cannot be expressed in a spec. '
-                'Construct the capability in Python to pass a store, or pick a built-in '
-                "backend with `backend='memory'|'file'|'sqlite'`."
-            )
-        if unsupported:
-            raise UserError(f'StepPersistence has no spec field(s) {sorted(unsupported)}.')
         if backend != 'file' and directory is not None:
             raise ValueError('directory is only valid with backend="file"')
         if backend != 'sqlite' and database is not None:
@@ -231,6 +220,7 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
             run_id=run_id,
             parent_run_id=parent_run_id,
             metadata=dict(metadata) if metadata is not None else {},
+            capture_frontier=capture_frontier,
             id=id,
             description=description,
             defer_loading=defer_loading,

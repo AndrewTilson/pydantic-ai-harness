@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import pytest
@@ -21,7 +21,6 @@ from pydantic_ai._agent_graph import GraphAgentState  # pyright: ignore[reportPr
 from pydantic_ai.agent.spec import AgentSpec
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import AgentNode, NodeResult
-from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -1673,12 +1672,20 @@ class TestFromSpecBackendValidation:
             StepPersistence.from_spec(backend='file', database=str(tmp_path / 'runs.db'))
 
     def test_store_is_runtime_only(self) -> None:
-        with pytest.raises(UserError, match='runtime-only'):
-            StepPersistence.from_spec(store=InMemoryStepStore())
+        with pytest.raises(TypeError, match='store'):
+            StepPersistence.from_spec(store=InMemoryStepStore())  # pyright: ignore[reportCallIssue]
 
-    def test_unknown_field_raises(self) -> None:
-        with pytest.raises(UserError, match=r"no spec field\(s\) \['bogus'\]"):
-            StepPersistence.from_spec(bogus=True)
+    @pytest.mark.parametrize(
+        ('backend', 'default_path'), [('file', '.step-persistence'), ('sqlite', '.step-persistence.db')]
+    )
+    async def test_default_location_is_documented_path(
+        self, backend: Literal['file', 'sqlite'], default_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cap: StepPersistence[Any] = StepPersistence.from_spec(backend=backend)
+        assert cap.metadata == {}
+        await Agent(TestModel(), capabilities=[cap]).run('hi')
+        assert (tmp_path / default_path).exists()
 
 
 class TestFromSpecSchema:
@@ -1693,10 +1700,14 @@ class TestFromSpecSchema:
         'run_id',
         'parent_run_id',
         'metadata',
+        'capture_frontier',
         'id',
         'description',
         'defer_loading',
     }
+
+    def test_default_id_stays_stable_for_durable_recovery(self) -> None:
+        assert StepPersistence.from_spec().id == 'step_persistence'
 
     def test_agent_spec_schema_publishes_fields_and_excludes_runtime_store(self) -> None:
         """The variadic signature published a bare `{'const': 'StepPersistence'}` with no `$defs` entry."""
@@ -1713,6 +1724,7 @@ class TestFromSpecSchema:
             run_id='librarian-1',
             parent_run_id='orchestrator-1',
             metadata={'team': 'docs'},
+            capture_frontier=True,
             id='steps',
             description='append-only step log',
             defer_loading=True,
@@ -1721,11 +1733,12 @@ class TestFromSpecSchema:
         assert cap.run_id == 'librarian-1'
         assert cap.parent_run_id == 'orchestrator-1'
         assert cap.metadata == {'team': 'docs'}
+        assert cap.capture_frontier is True
         assert cap.id == 'steps'
         assert cap.description == 'append-only step log'
         assert cap.defer_loading is True
 
-    def test_agent_spec_loads_configured_step_persistence(self, tmp_path: Path) -> None:
+    async def test_agent_spec_loads_configured_step_persistence(self, tmp_path: Path) -> None:
         agent = Agent.from_spec(
             {
                 'model': 'test',
@@ -1737,14 +1750,15 @@ class TestFromSpecSchema:
                             'max_snapshots_per_run': 3,
                             'agent_name': 'librarian',
                             'id': 'steps',
-                            'defer_loading': True,
                         }
                     }
                 ],
             },
             custom_capability_types=[StepPersistence],
         )
-        assert isinstance(agent, Agent)
+        await agent.run('hi')
+        runs = await FileStepStore(tmp_path).list_runs()
+        assert [run.agent_name for run in runs] == ['librarian']
 
 
 # ---------------------------------------------------------------------------

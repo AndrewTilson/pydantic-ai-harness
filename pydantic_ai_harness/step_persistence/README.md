@@ -440,6 +440,14 @@ forwards the bound to the store it constructs (`backend='memory'`, `'file'`, or
 rejects a `directory` without `backend='file'` and a `database` without
 `backend='sqlite'`, so a spec cannot name a location its backend would ignore.
 
+In an agent spec (`Agent.from_spec(..., custom_capability_types=[StepPersistence])`),
+`StepPersistence` accepts `backend` (default `'memory'`), `directory` (default
+`.step-persistence`), `database` (default `.step-persistence.db`),
+`max_snapshots_per_run`, `agent_name`, `run_id`, `parent_run_id`, `metadata`,
+`capture_frontier`, `id`, `description`, and `defer_loading`. These are published
+in the spec JSON schema. `store` is not a spec field: pass a custom store by
+constructing the capability in Python.
+
 ```python
 from pydantic_ai_harness.step_persistence import FileStepStore
 
