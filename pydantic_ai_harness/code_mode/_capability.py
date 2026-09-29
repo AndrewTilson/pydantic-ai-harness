@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterable, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -10,11 +10,25 @@ from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.capabilities._tool_search import ToolSearch as _ToolSearch
-from pydantic_ai.messages import ModelResponse, NativeToolSearchReturnPart, SystemPromptPart
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import AgentStreamEvent, ModelResponse, NativeToolSearchReturnPart, SystemPromptPart
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
 
-from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeResourceLimits, CodeModeToolset
+from pydantic_ai_harness.code_mode._eager import EagerCodeModeToolset
+from pydantic_ai_harness.code_mode._speculation import (
+    MAX_SPECULATIONS_PER_PART,
+    SpeculationCoordinator,
+    SpeculationStats,
+)
+from pydantic_ai_harness.code_mode._toolset import (
+    CodeModeMount,
+    CodeModeOS,
+    CodeModeResourceLimits,
+    CodeModeToolset,
+    as_os_handler,
+    in_durable_execution,
+)
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import ValidatedToolArgs
@@ -95,19 +109,58 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     """
 
     os_access: CodeModeOS | None = None
-    """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
+    """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable.
+
+    Pass an `AbstractOS` such as `OSAccess`, or a handler called with keyword arguments (see
+    `pydantic_monty.OsHandler`). A plain function is called from a Monty thread, not the event
+    loop's thread, with the run's contextvars set, so it must not touch asyncio objects; an `async`
+    handler is awaited on an event loop instead. Inside a Temporal workflow, clock, environment, and
+    randomness calls run on the workflow's own thread, so the handler can use `workflow.now()`.
+    The positional `(name, args, kwargs)` form is deprecated.
+    """
 
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
     resource_limits: CodeModeResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox execution limits, applied per Monty session.
+    """Sandbox execution limits.
 
-    `None` applies a 30-second execution and 256 MiB heap backstop. The guarantee is per snippet:
-    no single `run_code` snippet runs longer than `max_duration_secs`. It is not a run-wide budget,
-    since consecutive calls share one session allowance and any reset of the session (`restart:
-    true`, a crash, a type error, a host-side failure) starts a fresh one. `'unlimited'` removes
-    both caps.
+    `None` applies a 30-second execution and 256 MiB heap backstop. `max_duration_secs` is per
+    snippet: no single `run_code` snippet runs longer than it, and it is not a run-wide budget.
+    `'unlimited'` removes the time and memory caps, but Monty's finite suspension budget still
+    applies. Set `max_suspensions` to bound cumulative host interactions across consecutive snippets.
+    """
+
+    eager: bool = False
+    """Execute complete streamed statements before the `run_code` call finishes.
+
+    Needs asyncio, like the sandbox executor, and is inactive under durable execution. Side
+    effects cannot be rolled back and run before hooks on `run_code` see the completed call.
+    See the Code Mode guide for the execution and `restart` semantics.
+    """
+
+    speculate: Sequence[str] | Literal['declared'] | None = None
+    """Launch side-effect-free sandbox calls while the `run_code` arguments are still streaming.
+
+    Calls to eligible functions whose arguments are all keyword literals start as soon as their
+    text has streamed; when the completed snippet dispatches the same call, the in-flight result
+    is adopted instead of starting cold. Pass the names of tools that are safe to run early, or
+    `'declared'` to trust what the tools declare about themselves (`Tool(metadata={'read_only':
+    True})` or the MCP `readOnlyHint` annotation). At most `max_tool_calls` (and never more than
+    32) calls start early per `run_code` call, and they do not reserve from `max_tool_calls`:
+    unclaimed launches are extra bounded work alongside the dispatches the snippet makes.
+    Composes with `eager`. Inactive under durable execution and when the run's parallel
+    execution mode is sequential. See the Code Mode guide for the mechanics.
+    """
+
+    monty_sandbox_url: str | None = None
+    """Run sandboxed code on remote Monty workers reached over this `ws://` or `wss://` URL.
+
+    Only execution moves: tool dispatch, mounts, `os_access`, and print capture stay host-side
+    over the connection.
+
+    Use `wss://` unless the server is on a network you trust: the connection carries the tool calls
+    your agent executes, so anyone who can intercept it can choose what your tools run.
     """
 
     dynamic_catalog: bool = False
@@ -140,20 +193,60 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     keeps the system prompt shorter and is the better choice.
     """
 
+    speculation_stats: SpeculationStats = field(default_factory=SpeculationStats, init=False, repr=False)
+    """Aggregate launch/adopt/evict counters across this instance's runs, when `speculate` is set."""
+
+    _speculation: SpeculationCoordinator[AgentDepsT] | None = field(default=None, init=False, repr=False)
+
     _announced_tools: set[str] = field(default_factory=set[str], init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Converted once here, so the per-run copies and the toolsets built from this do not warn again.
+        self.os_access = as_os_handler(self.os_access)
+        if isinstance(self.speculate, str) and self.speculate != 'declared':
+            raise UserError(
+                f"`speculate` accepts a list of tool names or the string 'declared', not {self.speculate!r}. "
+                'To allowlist one tool, pass a one-element list.'
+            )
 
     def get_ordering(self) -> CapabilityOrdering:
         """CodeMode wraps around ToolSearch so that search_tools stays native."""
         return CapabilityOrdering(position='outermost', wraps=[_ToolSearch])
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> CodeMode[AgentDepsT]:
-        """Return a fresh instance so concurrent runs don't share `_announced_tools`."""
-        if not self.dynamic_catalog:
+        """Return a fresh instance so concurrent runs don't share `_announced_tools` or speculation state."""
+        if not self.dynamic_catalog and self.speculate is None:
             return self
-        return replace(self)
+        clone = replace(self)
+        # `replace` re-runs `__init__`, resetting `init=False` fields: `_announced_tools` starts
+        # fresh (intended), and the stats object is rebound so callers holding this instance
+        # observe counters accumulated by its per-run clones.
+        clone.speculation_stats = self.speculation_stats
+        if self.speculate is not None:
+            allowlist = 'declared' if isinstance(self.speculate, str) else frozenset(self.speculate)
+            clone._speculation = SpeculationCoordinator(
+                allowlist=allowlist,
+                stats=self.speculation_stats,
+                launch_cap=min(MAX_SPECULATIONS_PER_PART, self.max_tool_calls),
+            )
+        return clone
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
         """Wrap the agent's assembled toolset, splitting it into native + sandboxed subsets if needed."""
+        if self.eager:
+            return EagerCodeModeToolset(
+                wrapped=toolset,
+                tool_selector=self.tools,
+                max_retries=self.max_retries,
+                max_tool_calls=self.max_tool_calls,
+                resource_limits=self.resource_limits,
+                dynamic_catalog=self.dynamic_catalog,
+                os_access=self.os_access,
+                mount=self.mount,
+                monty_sandbox_url=self.monty_sandbox_url,
+                capability=self,
+                speculation=self._speculation,
+            )
         return CodeModeToolset(
             wrapped=toolset,
             tool_selector=self.tools,
@@ -163,7 +256,38 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
+            monty_sandbox_url=self.monty_sandbox_url,
+            capability=self,
+            speculation=self._speculation,
         )
+
+    @property
+    def has_wrap_run_event_stream(self) -> bool:
+        """Report the stream hook only when a streamed execution tier is enabled.
+
+        The base class detects a class-level override, which would put every `CodeMode` user in
+        streaming mode; gating on the instance keeps plain `CodeMode` runs non-streaming.
+        """
+        return self.eager or self.speculate is not None
+
+    async def wrap_run_event_stream(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        stream: AsyncIterable[AgentStreamEvent],
+    ) -> AsyncIterable[AgentStreamEvent]:
+        """Feed streamed `run_code` argument deltas to the eager pump and the speculation launcher.
+
+        Wrapped events pass through unmodified; the watchers act by side effect, enqueueing
+        closed statements for the live REPL and launching eligible calls. Inactive under durable
+        execution, where overlapping non-deterministic work with the stream has no place in a
+        replayed workflow.
+        """
+        toolset = None if in_durable_execution(ctx) else CodeModeToolset.from_run_context(ctx)
+        async for event in stream:
+            yield event
+            if toolset is not None:
+                await toolset.observe_stream_event(event, ctx)
 
     async def after_tool_execute(
         self,

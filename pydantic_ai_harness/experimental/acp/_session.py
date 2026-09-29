@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Generic, Protocol, TypeAlias
 
 from acp import Client, schema
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset
@@ -61,13 +62,21 @@ class AcpSession:
 class AcpSessionConfig(Generic[AgentDepsT]):
     """Per-session run configuration returned by a `session_config` factory.
 
-    `deps` and `toolsets` are applied to every agent run in that session, mirroring
-    `Agent.run(..., deps=..., toolsets=...)`. `toolsets` is added to the agent's own toolsets
+    `deps`, `capabilities`, and `toolsets` are applied to every agent run in that session, mirroring
+    `Agent.run(..., deps=..., capabilities=..., toolsets=...)`. Capabilities and toolsets are added to the agent's own
     rather than replacing them. `deps` is required; pass `deps=None` for an agent with no
     dependencies.
+
+    Configure session behavior through `capabilities`; reserve `toolsets` for bare toolsets such
+    as MCP servers or directly constructed `AcpFileSystemToolset` instances. A capability contributes its tools
+    along with its hooks, instructions, and event ownership, whereas reaching past it for its
+    toolset alone drops the rest -- and a
+    [`CapabilityEvent`][pydantic_ai.messages.CapabilityEvent] its tools emit then has no owning
+    capability to be attributed to, which is an error.
     """
 
     deps: AgentDepsT
+    capabilities: Sequence[AbstractCapability[AgentDepsT]] | None = None
     toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None
 
 

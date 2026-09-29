@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Coroutine, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any, Generic, cast
 
-from pydantic_ai.agent import AbstractAgent, EventStreamHandler
-from pydantic_ai.capabilities import AgentCapability
+from pydantic_ai.agent import AbstractAgent, AgentRunResult, EventStreamHandler
+from pydantic_ai.capabilities import AgentCapability, HookTimeoutError
 from pydantic_ai.exceptions import (
     ApprovalRequired,
     CallDeferred,
@@ -30,11 +32,37 @@ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 # Private import: pydantic-ai has no public way to tell capability-contributed
 # toolsets apart from the agent's own in `agent.toolsets`.
 from pydantic_ai.toolsets._capability_owned import CapabilityOwnedToolset
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RunUsage, UsageLimits
 
+from pydantic_ai_harness.subagents._events import (
+    DelegationEndEvent,
+    DelegationOutcome,
+    DelegationStartEvent,
+    bounded_text,
+)
 from pydantic_ai_harness.subagents._models import ModelOption, validate_restriction
 
 logger = logging.getLogger(__name__)
+
+SELF_AGENT_NAME = 'self'
+"""The name a delegate to the running agent itself is listed and called by (`SubAgents.include_self`)."""
+
+DEFAULT_MAX_DEPTH = 3
+"""Default `SubAgents.max_depth`: the top-level run, its delegates, and theirs."""
+
+_depth: ContextVar[int] = ContextVar('pydantic_ai_harness.subagents.depth', default=1)
+"""How deep in a delegation tree the current run is, counting the top-level run as 1.
+
+Set around each child run, so every run started inside a delegation -- including a delegation
+of a delegation -- reads its own level, and sibling delegations running concurrently in one
+parent step each read the level their parent set.
+"""
+
+
+def at_max_depth(max_depth: int) -> bool:
+    """Whether the current run is as deep in its delegation tree as `max_depth` allows, so it may not delegate."""
+    return _depth.get() >= max_depth
+
 
 _MODEL_ARG = 'model'
 """Name of the delegate tool's model-selection argument, shared by the function
@@ -139,6 +167,30 @@ class SubAgent(Generic[AgentDepsT]):
         return self.name or self.agent.name
 
 
+@dataclass(frozen=True, kw_only=True)
+class _Ended:
+    """How one delegation settled, before the parent hears about it."""
+
+    outcome: DelegationOutcome
+    output: str
+    """What the parent model receives: the child's output, or a steering or retry message."""
+    cause: Exception | None = None
+    """Set when `output` is raised to the parent as a `ModelRetry` rather than returned."""
+
+
+def _emits_events(ctx: RunContext[AgentDepsT]) -> bool:
+    """Whether the running tool belongs to a capability, so `ctx.emit` accepts a capability event.
+
+    A `SubAgentToolset` registered directly in `Agent(toolsets=[...])` has no owning
+    capability, and core refuses capability events from it; it emits nothing.
+    """
+    tool_name = ctx.tool_name
+    if tool_name is None:  # pragma: no cover - a tool call always names its tool
+        return False
+    tool_def = ctx.tools.get(tool_name)
+    return tool_def is not None and tool_def.capability_id is not None
+
+
 def _is_capability_contributed(toolset: AbstractToolset[AgentDepsT]) -> bool:
     """Whether `toolset`'s tree contains a `CapabilityOwnedToolset`."""
     found = False
@@ -180,6 +232,8 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         contain_errors: bool,
         call_counts: dict[str, dict[str, int]],
         models: Mapping[str, ModelOption] | None = None,
+        include_self: bool = False,
+        max_depth: int = DEFAULT_MAX_DEPTH,
     ) -> None:
         super().__init__()
         self._agents: dict[str, SubAgent[AgentDepsT]] = dict(agents)
@@ -190,6 +244,8 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         self._tool_name = tool_name
         self._contain_errors = contain_errors
         self._models: dict[str, ModelOption] = dict(models or {})
+        self._include_self = include_self
+        self._max_depth = max_depth
         for name, sub_agent in self._agents.items():
             validate_restriction(name, sub_agent.models, self._models)
         # Run-scoped delegation counts, keyed by run_id then sub-agent name.
@@ -197,15 +253,18 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         self._call_counts = call_counts
         self.add_function(self.delegate_task, name=tool_name, retries=tool_retries, prepare=self._prepare_delegate)
 
-    def _prepare_delegate(self, ctx: RunContext[AgentDepsT], tool_def: ToolDefinition) -> ToolDefinition:
-        """Shape the delegate tool's `model` argument to the configured menu.
+    def _prepare_delegate(self, ctx: RunContext[AgentDepsT], tool_def: ToolDefinition) -> ToolDefinition | None:
+        """Shape the delegate tool's `model` argument to the configured menu, or hide it at `max_depth`.
 
         With no menu the argument is dropped from the schema, so a capability that
         does not opt in exposes exactly the tool it did before. With a menu the
         argument becomes an enum of its keys, so the model picks from the offered
         options rather than inventing a model name. The result depends only on
-        static configuration, which keeps the tool schema cache-stable.
+        static configuration and on the run's delegation depth, which does not change during
+        a run, so the tool schema stays cache-stable.
         """
+        if at_max_depth(self._max_depth):
+            return None
         schema: ObjectJsonSchema = {**tool_def.parameters_json_schema}
         properties: dict[str, object] = {**schema.get('properties', {})}
         if self._models:
@@ -259,8 +318,8 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         counts[agent_name] = counts.get(agent_name, 0) + 1
         return counts[agent_name] > max_calls
 
-    def _resolve_model(self, agent_name: str, sub_agent: SubAgent[AgentDepsT], key: str | None) -> ModelOption | None:
-        """The menu option one delegation runs on, or `None` to leave the model as it was.
+    def _resolve_model_key(self, agent_name: str, sub_agent: SubAgent[AgentDepsT], key: str | None) -> str | None:
+        """The menu key one delegation runs on, or `None` to leave the model as it was.
 
         An unset `key` falls back to the delegate's own first allowed option, and
         to no option at all when the delegate allows the whole menu.
@@ -270,16 +329,15 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         """
         allowed = sub_agent.models
         if key is None:
-            return self._models[allowed[0]] if allowed else None
-        option = self._models.get(key)
-        if option is None:
+            return allowed[0] if allowed else None
+        if key not in self._models:
             available = ', '.join(self._models) or '(none configured)'
             raise ModelRetry(f'Unknown model {key!r}. Available models: {available}.')
         if allowed is not None and key not in allowed:
             raise ModelRetry(
                 f'Sub-agent {agent_name!r} cannot run on model {key!r}. Available models for it: {", ".join(allowed)}.'
             )
-        return option
+        return key
 
     async def delegate_task(
         self, ctx: RunContext[AgentDepsT], agent_name: str, task: str, model: str | None = None
@@ -298,13 +356,10 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
                 listed in the instructions. Omit it to use the sub-agent's default
                 model. Only offered when a model menu is configured.
         """
-        sub_agent = self._agents.get(agent_name)
-        if sub_agent is None:
-            available = ', '.join(sorted(self._agents))
-            raise ModelRetry(f'Unknown sub-agent {agent_name!r}. Available sub-agents: {available}.')
+        sub_agent = self._resolve_agent(ctx, agent_name)
 
         # Resolved before the call budget is charged, so a bad model key costs nothing.
-        option = self._resolve_model(agent_name, sub_agent, model)
+        key = self._resolve_model_key(agent_name, sub_agent, model)
 
         if sub_agent.max_calls is not None and self._budget_exhausted(ctx, agent_name, sub_agent.max_calls):
             return self._steer(
@@ -313,26 +368,72 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
                 f'({sub_agent.max_calls} call(s)). Synthesize from existing evidence and '
                 f'choose the next action; do not delegate to {agent_name!r} again.',
             )
+        return await self._run_delegation(ctx, agent_name, sub_agent, task=task, key=key)
 
-        toolsets = self._inherited_toolsets(ctx) if self._inherit_tools else None
+    def _resolve_agent(self, ctx: RunContext[AgentDepsT], agent_name: str) -> SubAgent[AgentDepsT]:
+        """The delegate `agent_name` names, with the running agent resolved at call time for `include_self`.
+
+        Raises:
+            ModelRetry: no delegate has that name.
+        """
+        if self._include_self and agent_name == SELF_AGENT_NAME:
+            agent = ctx.agent
+            if agent is None:  # pragma: no cover - the running agent is always set during a run
+                raise UserError('Delegating to the running agent requires `RunContext.agent`.')
+            return SubAgent(agent, name=SELF_AGENT_NAME)
+        sub_agent = self._agents.get(agent_name)
+        if sub_agent is None:
+            names = [*self._agents, SELF_AGENT_NAME] if self._include_self else list(self._agents)
+            raise ModelRetry(f'Unknown sub-agent {agent_name!r}. Available sub-agents: {", ".join(sorted(names))}.')
+        return sub_agent
+
+    async def _run_delegation(
+        self,
+        ctx: RunContext[AgentDepsT],
+        agent_name: str,
+        sub_agent: SubAgent[AgentDepsT],
+        *,
+        task: str,
+        key: str | None,
+    ) -> str:
+        """Run one accepted delegation, announcing its start and how it ended."""
+        # A delegation to the running agent already carries the parent's tools, so inheriting them
+        # again would register every tool twice.
+        is_self = self._include_self and agent_name == SELF_AGENT_NAME
+        inherit_tools = self._inherit_tools and not is_self
+        # Announced before the child coroutine exists, so an emit that does not return
+        # (a cancellation landing on the await) leaves no never-awaited coroutine behind.
+        emits = _emits_events(ctx)
+        if emits:
+            text, truncated = bounded_text(task)
+            await ctx.emit(
+                DelegationStartEvent(
+                    agent_name=agent_name, task=text, truncated=truncated, model=key, inherits_tools=inherit_tools
+                )
+            )
+        started = time.perf_counter()
+
+        toolsets = self._inherited_toolsets(ctx) if inherit_tools else None
         capabilities = self._shared_capabilities or None
         usage_limits: UsageLimits | None
         if sub_agent.usage_limits is not None:
             # Isolated accounting so the per-child budget counts only this child.
             own_budget = True
-            usage = None
+            child_usage = RunUsage()
             usage_limits = sub_agent.usage_limits
         else:
             own_budget = False
-            usage = ctx.usage if self._forward_usage else None
+            child_usage = None if self._forward_usage else RunUsage()
             usage_limits = None
 
         # A selected menu option decides the model and how it runs. Without one, a
         # sub-agent with no model of its own (e.g. one loaded from disk) inherits the
-        # parent run's model, and one that brought its own keeps it.
+        # parent run's model, and one that brought its own keeps it. The running agent runs on
+        # the parent run's model, which may be a run-level override of the agent's own.
         run_model: Model | KnownModelName | str | None
         settings: ModelSettings | None
-        if option is not None:
+        if key is not None:
+            option = self._models[key]
             run_model = option.model
             settings = option.settings
         else:
@@ -345,7 +446,7 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             ctx_model = ctx.model
             run_model = (
                 cast('Model[Any]', ctx_model)
-                if sub_agent.agent.model is None and isinstance(ctx_model, Model)
+                if (is_self or sub_agent.agent.model is None) and isinstance(ctx_model, Model)
                 else None
             )
             settings = None
@@ -354,50 +455,104 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             deps=ctx.deps,
             model=run_model,
             model_settings=settings,
-            usage=usage,
+            usage=ctx.usage if child_usage is None else child_usage,
             usage_limits=usage_limits,
             toolsets=toolsets,
             capabilities=capabilities,
             event_stream_handler=self._event_stream_handler,
         )
+        token = _depth.set(_depth.get() + 1)
+        try:
+            ended = await self._settle(agent_name, sub_agent, run, own_budget=own_budget)
+        finally:
+            _depth.reset(token)
+        if emits:
+            text, truncated = bounded_text(ended.output)
+            await ctx.emit(
+                DelegationEndEvent(
+                    agent_name=agent_name,
+                    outcome=ended.outcome,
+                    output=text,
+                    truncated=truncated,
+                    usage=child_usage,
+                    duration_seconds=time.perf_counter() - started,
+                )
+            )
+        if ended.cause is not None:
+            raise ModelRetry(ended.output) from ended.cause
+        return ended.output
+
+    async def _settle(
+        self,
+        agent_name: str,
+        sub_agent: SubAgent[AgentDepsT],
+        run: Coroutine[Any, Any, AgentRunResult[Any]],
+        *,
+        own_budget: bool,
+    ) -> _Ended:
+        """Await the child and turn what happened into what the parent receives.
+
+        Soft outcomes become a steering message the parent reads as a normal tool
+        result; a child's soft failure or contained crash becomes a `ModelRetry`
+        the caller raises. Everything else propagates and aborts the delegation.
+        """
         timeout = sub_agent.timeout_seconds
         try:
             result = await (asyncio.wait_for(run, timeout) if timeout is not None else run)
-        except asyncio.TimeoutError:
-            return self._steer(
-                sub_agent.on_failure,
-                f'Sub-agent {agent_name!r} exceeded its {timeout}s time budget. '
-                f'Treat this as a recoverable observation and decide from existing evidence.',
+        except asyncio.TimeoutError as exc:
+            if timeout is None or isinstance(exc, HookTimeoutError):
+                # The child itself timed out: a hook overran its own budget, or no
+                # delegation budget is set at all. That is a child crash, so the
+                # crash handlers decide what the parent sees.
+                return self._crash_outcome(agent_name, sub_agent, exc)
+            return _Ended(
+                outcome='timeout',
+                output=self._steer(
+                    sub_agent.on_failure,
+                    f'Sub-agent {agent_name!r} exceeded its {timeout}s time budget. '
+                    f'Treat this as a recoverable observation and decide from existing evidence.',
+                ),
             )
         except UsageLimitExceeded:
             if own_budget:
-                return self._steer(
-                    sub_agent.on_failure,
-                    f'Sub-agent {agent_name!r} reached its usage budget. '
-                    f'Treat this as a recoverable observation and decide from existing evidence.',
+                return _Ended(
+                    outcome='budget',
+                    output=self._steer(
+                        sub_agent.on_failure,
+                        f'Sub-agent {agent_name!r} reached its usage budget. '
+                        f'Treat this as a recoverable observation and decide from existing evidence.',
+                    ),
                 )
             # A shared/parent usage limit means the whole tree is out of budget.
             raise
         except (ModelRetry, UnexpectedModelBehavior) as exc:
             if sub_agent.on_failure is not None:
-                return sub_agent.on_failure
+                return _Ended(outcome='failed', output=sub_agent.on_failure)
             # Soft sub-agent failures come back to the parent as a retry it can react to.
-            raise ModelRetry(f'Sub-agent {agent_name!r} failed: {exc}') from exc
+            return _Ended(outcome='failed', output=f'Sub-agent {agent_name!r} failed: {exc}', cause=exc)
         except _ALWAYS_PROPAGATE:
             raise
         except Exception as exc:
-            contain = sub_agent.contain_errors if sub_agent.contain_errors is not None else self._contain_errors
-            if not contain:
-                raise
-            # Contain the crash so it cannot abort the parent, but keep it loud: the
-            # exception rides the retry message and is logged, and `tool_retries`
-            # bounds consecutive crashes into an abort.
-            logger.warning('Contained crash from sub-agent %r', agent_name, exc_info=exc)
-            raise ModelRetry(
+            return self._crash_outcome(agent_name, sub_agent, exc)
+        return _Ended(outcome='ok', output=str(result.output))
+
+    def _crash_outcome(self, agent_name: str, sub_agent: SubAgent[AgentDepsT], exc: Exception) -> _Ended:
+        """Contain an unexpected child crash, or let it abort the parent."""
+        contain = sub_agent.contain_errors if sub_agent.contain_errors is not None else self._contain_errors
+        if not contain:
+            raise exc
+        # Contain the crash so it cannot abort the parent, but keep it loud: the
+        # exception rides the retry message and is logged, and `tool_retries`
+        # bounds consecutive crashes into an abort.
+        logger.warning('Contained crash from sub-agent %r', agent_name, exc_info=exc)
+        return _Ended(
+            outcome='contained',
+            output=(
                 f'Sub-agent {agent_name!r} crashed: {type(exc).__name__}: {exc}. '
                 f'Treat this as a recoverable failure and decide from existing evidence.'
-            ) from exc
-        return str(result.output)
+            ),
+            cause=exc,
+        )
 
     @staticmethod
     def _steer(on_failure: str | None, default: str) -> str:

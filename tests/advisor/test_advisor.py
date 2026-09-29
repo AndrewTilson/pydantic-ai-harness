@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import pytest
 from inline_snapshot import snapshot
@@ -24,6 +25,10 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from pydantic_ai_harness.advisor import Advisor
+from tests.conftest import agent_run_names  # pyright: ignore[reportMissingTypeStubs]
+
+if TYPE_CHECKING:
+    from logfire.testing import CaptureLogfire
 
 pytestmark = pytest.mark.anyio
 
@@ -90,6 +95,27 @@ class TestAdvisor:
         assert seen[0].function_tools == []
         assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8', max_tokens=2048, caching='5m')]
 
+    async def test_local_advisor_run_belongs_to_the_executor_conversation(self) -> None:
+        advisor_conversations: set[str | None] = set()
+
+        def advisor_model(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            advisor_conversations.update(m.conversation_id for m in messages)
+            return ModelResponse(parts=[TextPart('Use a staged rollout.')])
+
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
+                return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'Is this safe?'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent = Agent(
+            FunctionModel(executor),
+            capabilities=[Advisor(FunctionModel(advisor_model), mode='local', forward_history=False)],
+        )
+
+        await agent.run('Review this plan.', conversation_id='conversation-1')
+
+        assert advisor_conversations == {'conversation-1'}
+
     async def test_model_instance_uses_local_advisor_and_preserves_identity(self) -> None:
         advisor_prompts: list[str] = []
         advisor_settings: list[ModelSettings | None] = []
@@ -117,6 +143,27 @@ class TestAdvisor:
 
         assert advisor_prompts == ['How should I deploy this?']
         assert advisor_settings == [ModelSettings(max_tokens=2048)]
+
+    @pytest.mark.usefixtures('instrument_all_agents')
+    async def test_local_advisor_run_is_named_after_the_capability(self, capfire: CaptureLogfire) -> None:
+        def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart('Use a staged rollout.')])
+
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not _has_tool_return(messages):
+                return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'How?'}, tool_call_id='advisor-1')])
+            return ModelResponse(parts=[TextPart('done')])
+
+        advisor = _ProviderFunctionModel('anthropic', advisor_model)
+        agent = Agent(
+            _ProviderFunctionModel('anthropic', executor, supports_advisor=True),
+            name='outer',
+            capabilities=[Advisor(advisor)],
+        )
+
+        await agent.run('Plan the deployment.')
+
+        assert 'advisor' in agent_run_names(capfire)
 
     async def test_unsupported_native_profile_exposes_local_tool(self) -> None:
         seen: list[ModelRequestParameters] = []
@@ -395,12 +442,19 @@ class TestAdvisor:
         with pytest.raises(UserError, match=f'requires a {required_provider} executor'):
             await agent.run('Review this.')
 
-    async def test_rejects_duplicate_capability_or_tool_name(self) -> None:
+    async def test_composes_duplicates_and_rejects_a_conflicting_tool_name(self) -> None:
         model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
 
+        # This branch pins the composing behaviour; `_RESOLVES_DUPLICATE_IDS` keeps the file
+        # runnable against a released core that still raises (see its docstring).
         if _RESOLVES_DUPLICATE_IDS:  # pragma: no cover - depends on the installed core
-            # An agent has one advisor, so the two resolve to one instead of colliding.
-            await Agent(model, capabilities=[Advisor(model), Advisor(model)]).run('Review this.')
+            # An agent has one advisor, so two resolve to one rather than colliding -- which is
+            # what lets two packaged harnesses that each carry an `Advisor` compose. The later
+            # configuration wins where both state one.
+            agent = Agent(model, capabilities=[Advisor(model, max_tokens=2048), Advisor(model, max_tokens=4096)])
+            await agent.run('Review this.')
+            merged = next(c for c in agent._root_capability.capabilities if isinstance(c, Advisor))  # pyright: ignore[reportPrivateUsage]
+            assert merged.max_tokens == 4096
         else:  # pragma: no cover - depends on the installed core
             with pytest.raises(UserError, match="Capability id 'advisor' is used by multiple capabilities"):
                 Agent(model, capabilities=[Advisor(model), Advisor(model)])
