@@ -1,6 +1,6 @@
 ---
 title: StackOne
-description: Let a Pydantic AI agent use actions from one of the user's linked business applications through StackOne.
+description: "Connect a Pydantic AI agent to a user's linked business apps, such as BambooHR, Salesforce, Workday, or Zendesk, and run their actions through StackOne."
 ---
 
 # StackOne
@@ -26,7 +26,7 @@ You also need an API key for the model your agent uses.
 ## Installation
 
 ```bash
-uv add "pydantic-ai-harness[stackone]" "pydantic-ai-slim[openai,spec]"
+pip/uv-add "pydantic-ai-harness[stackone]" "pydantic-ai-slim[openai,spec]"
 ```
 
 The `openai` and `spec` extras support the model and agent-spec examples below. Install the provider extra for a

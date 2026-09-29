@@ -1,6 +1,6 @@
 ---
 title: Researcher
-description: A complete Pydantic AI web-research harness with source-backed answers.
+description: "Build a web research agent with Pydantic AI Harness: Researcher combines web search, page fetching, and a research subagent to answer with cited sources."
 ---
 
 # Researcher
@@ -15,7 +15,7 @@ It is a regular [combined capability](https://pydantic.dev/docs/ai/capabilities/
 Install the local search and fetch fallbacks (DuckDuckGo search, page-to-Markdown fetching):
 
 ```bash
-uv add "pydantic-ai-harness[researcher]"
+pip/uv-add "pydantic-ai-harness[researcher]"
 ```
 
 Then ask it a question:

@@ -1,6 +1,6 @@
 ---
 title: You.com
-description: Give a Pydantic AI agent web research tools backed by the You.com APIs -- search with query-relevant excerpts or full-page markdown, page retrieval, cited one-call answers, and multi-step research including a finance-tuned mode.
+description: "Give a Pydantic AI agent You.com web search, page reads, cited answers, and multi-step deep research, including a finance research mode, via the You.com APIs."
 ---
 
 # You.com
@@ -36,7 +36,7 @@ honored). The examples below use an Anthropic model and `Agent.from_file`, so
 they also pull in the `anthropic` provider and the `spec` YAML support:
 
 ```bash
-uv add "pydantic-ai-harness[youdotcom,anthropic]" "pydantic-ai-slim[spec]"
+pip/uv-add "pydantic-ai-harness[youdotcom,anthropic]" "pydantic-ai-slim[spec]"
 ```
 
 Then pass the capabilities to an `Agent` via the `capabilities` parameter:

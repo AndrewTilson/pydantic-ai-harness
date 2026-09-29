@@ -44,7 +44,10 @@ from tests.conftest import agent_run_names  # pyright: ignore[reportMissingTypeS
 if TYPE_CHECKING:
     from logfire.testing import CaptureLogfire
 
-pytestmark = pytest.mark.anyio
+pytestmark = [
+    pytest.mark.anyio,
+    pytest.mark.filterwarnings('ignore::pydantic_ai_harness.HarnessDeprecationWarning'),
+]
 
 
 @pytest.fixture
@@ -65,6 +68,11 @@ def _ctx(
     ctx.messages = messages if messages is not None else []
     ctx.usage = usage if usage is not None else RunUsage()
     ctx.usage_limits = usage_limits if usage_limits is not None else UsageLimits()
+
+    async def emit(event: Any) -> Any:
+        return event
+
+    ctx.emit = emit
     return ctx
 
 
@@ -606,6 +614,22 @@ class TestLLMReminder:
         await agent.run('stay focused')
 
         assert 'system_reminders' in agent_run_names(capfire)
+
+    async def test_generation_run_belongs_to_the_reminded_conversation(self) -> None:
+        generation_conversations: set[str | None] = set()
+
+        def generate(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            generation_conversations.update(m.conversation_id for m in messages)
+            return ModelResponse(parts=[TextPart('refocus')])
+
+        agent = Agent(
+            TestModel(call_tools=[]),
+            capabilities=[SystemReminders(dynamic_reminders=[LLMReminder(model=FunctionModel(generate))])],
+        )
+
+        await agent.run('stay focused', conversation_id='conversation-1')
+
+        assert generation_conversations == {'conversation-1'}
 
     async def test_generation_dispatches_as_durable_operation(self) -> None:
         durability = RecordingDurability()
