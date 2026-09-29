@@ -1,5 +1,11 @@
 # CLAI 2.0
 
+> [!WARNING]
+> **This repository is being merged into [Pydantic AI](https://github.com/pydantic/pydantic-ai) and will be archived.**
+> `pydantic-ai-harness` and `pydantic-clai2` are now developed there, in [`src/pydantic_ai_harness`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness) and [`src/pydantic_clai2`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_clai2), with their full history.
+> Please open new issues and pull requests on [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai/issues).
+> The PyPI package names stay the same, and future releases will be published from Pydantic AI.
+
 A separately installable terminal client for Pydantic AI. The coding tools,
 `Coder(unrestricted_filesystem=True)`, are the built-in `coder` plugin: on by
 default, `/plugins disable coder` for a chat-only shell. The model can also ask
@@ -689,7 +695,15 @@ the agent's configured tools determine how it can access it. Separately, bracket
 paste of existing image paths creates attachments as described in
 [Pasting images](#pasting-images).
 
-Up/down move through multiline drafts, then recall saved prompt history.
+Up/down move through multiline drafts, then recall queued messages and saved
+prompt history. Queued messages come first, newest first, because they are
+your most recent input; Up then continues into history, skipping the copies of
+queued messages that history already holds. Enter on a recalled queued message
+rewrites it in place, keeping its position in the queue, and the queue row
+shows `(editing)` meanwhile. Clearing the draft and pressing Enter removes the
+message from the queue. If the run takes the message before you press Enter,
+the edit is queued as a new follow-up. With nothing queued, Up/down only walk
+history.
 Enter submits a prompt when idle and queues a separate follow-up turn when busy.
 To steer instead, first queue the message with Enter, then press Alt+Enter
 (Option+Enter). This sends the oldest queued follow-up to the active run at its
