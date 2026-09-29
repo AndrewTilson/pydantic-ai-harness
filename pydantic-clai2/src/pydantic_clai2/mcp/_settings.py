@@ -79,19 +79,21 @@ class SSEServer(RemoteServer):
     type: Literal['sse']
 
 
-def _legacy_key(value: object) -> object:
-    """Plugin settings written before `/mcp install` named the discriminator `transport`."""
+def _infer_type(value: object) -> object:
+    """Fill in a missing `type`: older plugin settings named it `transport`; Claude Code omits it for stdio."""
     if isinstance(value, dict):
         raw = _RAW.validate_python(value)
         if 'transport' in raw and 'type' not in raw:
             raw['type'] = raw.pop('transport')
+        if 'command' in raw and 'type' not in raw:
+            raw['type'] = 'stdio'
         return raw
     return value
 
 
 _RAW: TypeAdapter[dict[str, object]] = TypeAdapter(dict[str, object])
 
-Server = Annotated[StdioServer | HTTPServer | SSEServer, Field(discriminator='type'), BeforeValidator(_legacy_key)]
+Server = Annotated[StdioServer | HTTPServer | SSEServer, Field(discriminator='type'), BeforeValidator(_infer_type)]
 Servers = dict[ServerName, Server]
 
 
@@ -121,7 +123,9 @@ def http_client(
 def references(server: Server) -> list[str]:
     """Environment variables named by `$VAR` in `env` values or `headers`, in first-use order."""
     values = server.env if isinstance(server, StdioServer) else server.headers
-    names = (name for value in (values or {}).values() for name in Template(value).get_identifiers())
+    # `Template.get_identifiers` is 3.11+; this is its implementation for the default pattern.
+    matches = (match for value in (values or {}).values() for match in Template.pattern.finditer(value))
+    names = (name for match in matches if (name := match['named'] or match['braced']))
     return list(dict.fromkeys(names))
 
 
