@@ -98,7 +98,7 @@ from pydantic_ai_harness.system_reminders import LLMReminder
 SystemReminders(dynamic_reminders=[LLMReminder(model='anthropic:claude-haiku-4-5')])
 ```
 
-Dynamic reminders have no cadence of their own -- they run on every model request. `LLMReminder` therefore issues one extra model call per turn (its usage is threaded onto the parent run via `ctx.usage`, so it shows up in `result.usage()`). The nested call also runs under the parent's `usage_limits` with one request held back for the model request it precedes, so the reminder cannot push a run past its `request_limit`; once the budget is that tight the generation is skipped and `GoalReanchor` text is used instead. Because the fallback is silent, a persistently misconfigured `model` (bad id, missing key) looks like normal operation. To bound the cost, gate it behind a cadence with an async wrapper:
+Dynamic reminders have no cadence of their own -- they run on every model request. `LLMReminder` therefore issues one extra model call per turn (its usage is threaded onto the parent run via `ctx.usage`, so it shows up in `result.usage()`, and the generation run is filed under the parent's `conversation_id`). The nested call also runs under the parent's `usage_limits` with one request held back for the model request it precedes, so the reminder cannot push a run past its `request_limit`; once the budget is that tight the generation is skipped and `GoalReanchor` text is used instead. Because the fallback is silent, a persistently misconfigured `model` (bad id, missing key) looks like normal operation. To bound the cost, gate it behind a cadence with an async wrapper:
 
 ```python
 _llm = LLMReminder(model='anthropic:claude-haiku-4-5')
@@ -127,6 +127,26 @@ Without a durability engine, generation runs directly in all three cases, with t
 
 ## Configuration
 
+Subscribe to `ReminderFiredEvent` to observe reminders after they are appended:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness import SystemReminders
+from pydantic_ai_harness.system_reminders import Reminder, ReminderFiredEvent
+
+agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[SystemReminders(reminders=[Reminder('...', interval=5)])],
+)
+
+@agent.on_event(ReminderFiredEvent)
+async def record(ctx, event):
+    print(event.text)
+```
+
+Migration: `on_fire` remains supported but is deprecated. Move its callback body to this
+subscription.
+
 ```python
 from pydantic_ai_harness import SystemReminders
 from pydantic_ai_harness.system_reminders import Reminder
@@ -135,7 +155,6 @@ SystemReminders(
     reminders=[Reminder('...', interval=5)],
     dynamic_reminders=[],       # callables evaluated every request
     cache_ttl='5m',             # TTL for the cache breakpoint before the reminder ('5m' | '1h')
-    on_fire=None,               # optional callback invoked with each rendered reminder
 )
 ```
 

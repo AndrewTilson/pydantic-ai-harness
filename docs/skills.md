@@ -1,6 +1,6 @@
 ---
 title: Skills
-description: Load Agent Skill instructions as on-demand Pydantic AI capabilities.
+description: "Load Agent Skills (SKILL.md files) into a Pydantic AI agent on demand: the model sees each skill's name and description and loads its instructions when needed."
 ---
 
 # Skills
@@ -22,7 +22,7 @@ Pydantic AI's `load_capability` tool to receive that skill's instructions.
 Install the `skills` extra for YAML frontmatter support:
 
 ```bash
-uv add "pydantic-ai-harness[skills]"
+pip/uv-add "pydantic-ai-harness[skills]"
 ```
 
 ## Quick start

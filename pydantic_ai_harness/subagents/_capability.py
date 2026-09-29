@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic_ai._utils import replace_no_init  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.agent import Agent, AgentRunResult, EventStreamHandler
 from pydantic_ai.capabilities import AbstractCapability, AgentCapability, WrapRunHandler
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, RunContext
@@ -23,7 +26,13 @@ from pydantic_ai_harness.subagents._disk import (
 )
 from pydantic_ai_harness.subagents._effort import clamp_effort
 from pydantic_ai_harness.subagents._models import ModelOption, as_option, model_label, validate_restriction
-from pydantic_ai_harness.subagents._toolset import SubAgent, SubAgentToolset
+from pydantic_ai_harness.subagents._toolset import (
+    DEFAULT_MAX_DEPTH,
+    SELF_AGENT_NAME,
+    SubAgent,
+    SubAgentToolset,
+    at_max_depth,
+)
 
 if TYPE_CHECKING:
     from pydantic_ai._instructions import AgentInstructions
@@ -37,6 +46,23 @@ def _option_line(key: str, option: ModelOption) -> str:
     """One model-menu line for the prompt listing: the key, its model, its hint."""
     label = f'- {key} ({model_label(option.model)})'
     return f'{label}: {option.description}' if option.description else label
+
+
+_SELF_DESCRIPTION = (
+    'A fresh run of this same agent, with all of your tools, instructions, and capabilities. '
+    'Use it to hand off a self-contained part of the work.'
+)
+"""How the running agent is described in the prompt listing when `include_self` is on."""
+
+_MERGEABLE_FIELDS = frozenset({'agents', 'models', 'include_self'})
+"""The only fields a merge composes: the roster (including whether it lists the running agent),
+and the model options that roster may pick from.
+
+An allow-list rather than a list of exceptions. Every other public field of `SubAgents` says *how*
+the delegates run rather than *who* they are -- so merging them applies one harness's policy to the
+other's sub-agents. Enumerating those instead would mean a field added
+later merges silently by default, which is the wrong way round for a decision nobody made.
+"""
 
 
 @dataclass
@@ -69,6 +95,11 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     precedence, then the project folder, then the home folder. A disk delegate whose
     name is already taken is skipped with a warning. Configure or disable this with
     `agent_folders`; see also `agent_overrides` and `tool_resolver`.
+
+    With `include_self=True`, the roster also lists the running agent itself, as `self`:
+    a delegation starts a fresh run of `RunContext.agent`, so the delegate has every
+    capability, tool, and instruction bound to that agent, including guardrails and
+    approval hooks added next to this one. Delegations nest at most `max_depth` levels.
 
     The parent's `deps` are forwarded to each sub-agent (sub-agents therefore
     share the parent's `AgentDepsT`), and by default the parent's `usage` is
@@ -163,6 +194,18 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     tool_name: str = 'delegate_task'
     """Name of the delegate tool exposed to the model."""
 
+    id: str | None = field(default='sub_agents', kw_only=True)
+    """One-off: an agent exposes a single delegate tool, so the id is fixed.
+
+    `tool_name` is one name, so two `SubAgents` capabilities register the same tool and collide.
+    Declaring the id here is what makes two of them merge instead, unioning their rosters -- which
+    is what lets a packaged harness that delegates compose with another that does the same.
+
+    Keyword-only on the field rather than through a `KW_ONLY` marker: a marker applies to every
+    field after it, which would take `tool_retries` and `contain_errors` off the positional
+    contract they already have.
+    """
+
     tool_retries: int | None = 2
     """Retries for the delegate tool -- how many extra attempts it gets after a
     sub-agent error before the parent run aborts. A sub-agent failure (e.g. it
@@ -180,6 +223,29 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     can override this per delegate. See `SubAgent.contain_errors` for the
     containment contract and what always propagates regardless."""
 
+    include_self: bool = False
+    """If `True`, the roster also lists the running agent itself, as `self`.
+
+    A delegation to `self` starts a fresh run of `RunContext.agent` on the parent run's model
+    (or the `models` option the parent picks), so the delegate has every capability, toolset, and instruction bound to that `Agent` --
+    guardrails, approval gates, and audit hooks included, since they are registered again in
+    the child run. What was passed to the parent's `run()` rather than bound to the `Agent`
+    (run-level `capabilities`, `toolsets`, `instructions`, `model_settings`) does not carry
+    over, so this capability has to be bound to the `Agent` itself; passing it to `run()`
+    raises a `UserError` when the run starts.
+
+    `inherit_tools` does not apply to `self`, whose tools are already the parent's. The
+    delegate can delegate in turn, up to `max_depth`."""
+
+    max_depth: int = DEFAULT_MAX_DEPTH
+    """How many levels a delegation tree may have, counting the top-level run as the first.
+
+    The default of `3` lets the top-level run delegate, and its delegates delegate once more.
+    A run at the limit gets neither the delegate tool nor the sub-agent listing. The level
+    is tracked per task tree, across every `SubAgents` capability, and each capability enforces
+    its own limit. This bounds `include_self`, whose delegate carries the delegate tool again,
+    and a roster that reaches the same agent through another path."""
+
     _by_name: dict[str, SubAgent[AgentDepsT]] = field(
         default_factory=dict[str, 'SubAgent[AgentDepsT]'], init=False, repr=False, compare=False
     )
@@ -190,6 +256,9 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     """`models` normalized to `ModelOption` entries, built in `__post_init__`.
     Insertion order matches `models` for a stable prompt listing and enum."""
 
+    _delegation_off: bool = field(default=False, init=False, repr=False, compare=False)
+    """Set on the instance `for_run` returns for a run at `max_depth`, which contributes nothing."""
+
     _call_counts: dict[str, dict[str, int]] = field(
         default_factory=dict[str, 'dict[str, int]'], init=False, repr=False, compare=False
     )
@@ -197,11 +266,31 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     toolset and cleared per run in `wrap_run`. Backs `SubAgent.max_calls`."""
 
     def __post_init__(self) -> None:
+        self._build_roster(self._load_disk_agents())
+
+    def _disk_agents(self) -> list[SubAgent[AgentDepsT]]:
+        """The delegates in this roster that came from disk rather than from `agents`.
+
+        Read back off the materialized roster rather than loaded again: `_load_disk_agents` reads
+        the filesystem relative to the *current* working directory, so calling it a second time can
+        answer differently than it did at construction.
+        """
+        explicit = {id(sub_agent) for sub_agent in self.agents}
+        return [sub_agent for sub_agent in self._by_name.values() if id(sub_agent) not in explicit]
+
+    def _build_roster(self, disk_agents: list[SubAgent[AgentDepsT]]) -> None:
+        if self.max_depth < 1:
+            raise ValueError(f'`max_depth` counts the top-level run, so it must be at least 1; got {self.max_depth}.')
         by_name: dict[str, SubAgent[AgentDepsT]] = {}
         for sub_agent in self.agents:
             name = sub_agent.resolved_name
             if name is None:
                 raise ValueError('Sub-agent has no name: give its `Agent` a `name`, or set `SubAgent(name=...)`.')
+            if self.include_self and name == SELF_AGENT_NAME:
+                raise ValueError(
+                    f'Sub-agent name {SELF_AGENT_NAME!r} is taken by the running agent when `include_self=True`; '
+                    f'set `SubAgent(name=...)` to rename it.'
+                )
             if name in by_name:
                 raise ValueError(
                     f'Duplicate sub-agent name {name!r}. Each sub-agent needs a distinct name; '
@@ -212,11 +301,11 @@ class SubAgents(AbstractCapability[AgentDepsT]):
         # folders, so a name already taken is shadowed (a warning, not an error --
         # overriding a home agent from the project, or a disk agent from code, is
         # the intended path).
-        for sub_agent in self._load_disk_agents():
+        for sub_agent in disk_agents:
             name = sub_agent.resolved_name
             if name is None:  # pragma: no cover - disk agents always get a name (frontmatter or stem)
                 continue
-            if name in by_name:
+            if name in by_name or (self.include_self and name == SELF_AGENT_NAME):
                 warnings.warn(
                     f'Disk sub-agent {name!r} is shadowed by a higher-precedence definition; skipping it.',
                     stacklevel=2,
@@ -286,18 +375,48 @@ class SubAgents(AbstractCapability[AgentDepsT]):
             toolsets.extend(resolved)
         return toolsets
 
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractCapability[AgentDepsT]:
+        """This capability, or for a run at `max_depth` a copy without the delegate tool and listing."""
+        if not at_max_depth(self.max_depth):
+            return self
+        return replace_no_init(self, _delegation_off=True)
+
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Run the parent agent, then drop this run's delegation counts so they don't accumulate."""
+        if self.include_self:
+            self._require_bound_to(ctx.agent)
         try:
             return await handler()
         finally:
             self._call_counts.pop(ctx.run_id or '', None)
 
+    def _require_bound_to(self, agent: Agent[Any, Any] | None) -> None:
+        """Refuse a run where delegating to `agent` would not bring this capability along.
+
+        A delegation to the running agent runs `agent` again, which re-registers what is bound to it
+        and nothing that was passed to `run()`. If this capability was passed to `run()`, the
+        delegate would come up without it, and most likely without the capabilities passed next to
+        it, which is the difference `include_self` exists to remove. Checked by equality rather
+        than by type, so a different `SubAgents` bound to the agent -- which a run-level one of the
+        same `id` overrides -- does not stand in for this one.
+        """
+        if agent is None:  # pragma: no cover - the running agent is always set during a run
+            return
+        bound: list[AbstractCapability[Any]] = []
+        agent.root_capability.apply(bound.append)
+        if self not in bound:
+            raise UserError(
+                '`SubAgents(include_self=True)` delegates to a fresh run of the agent, which only carries what is '
+                'bound to the `Agent`, not what was passed to `run()`. Bind this capability (and whatever it '
+                'should bring along, such as `Coder`) with `Agent(capabilities=[...])`, or turn delegation to '
+                'the running agent off.'
+            )
+
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Static, cache-stable listing of the available sub-agents and models."""
-        if not self._by_name:
+        if self._delegation_off or (not self._by_name and not self.include_self):
             return None
-        lines: list[str] = []
+        lines: list[str] = [f'- {SELF_AGENT_NAME}: {_SELF_DESCRIPTION}'] if self.include_self else []
         for name, sub_agent in self._by_name.items():
             description = sub_agent.description or sub_agent.agent.description
             restriction = f' (models: {", ".join(sub_agent.models)})' if sub_agent.models else ''
@@ -319,7 +438,7 @@ class SubAgents(AbstractCapability[AgentDepsT]):
 
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
         """Toolset providing the delegate tool, or `None` when no sub-agents are configured."""
-        if not self._by_name:
+        if self._delegation_off or (not self._by_name and not self.include_self):
             return None
         return SubAgentToolset(
             agents=self._by_name,
@@ -332,9 +451,55 @@ class SubAgents(AbstractCapability[AgentDepsT]):
             contain_errors=self.contain_errors,
             call_counts=self._call_counts,
             models=self._menu,
+            include_self=self.include_self,
+            max_depth=self.max_depth,
         )
 
     @classmethod
     def get_serialization_name(cls) -> str | None:
         """Not spec-serializable -- the capability holds live `Agent` instances."""
         return None
+
+    @classmethod
+    def combine(cls, capabilities: Sequence[AbstractCapability[AgentDepsT]]) -> AbstractCapability[AgentDepsT]:
+        """Compose the rosters, and require everything else to already agree.
+
+        Two packaged harnesses on one agent each bring their delegates, and composing them is what
+        the shared `id` is for. Only `agents` and `models` are composed. Every other field decides
+        how the delegates *run* -- what capabilities they are handed, whether they see the parent's
+        tools, what the delegate tool is called, where delegates are loaded from -- so merging it
+        would apply one harness's policy to the other's sub-agents, which neither author asked for.
+        Those must agree, and say so when they do not.
+
+        The roster is rebuilt from the delegates the inputs already materialized rather than by
+        re-running `__post_init__`: that reloads `agent_folders` relative to the current working
+        directory and re-invokes `tool_resolver`, so a merge could answer differently than either
+        input did.
+        """
+        first = capabilities[0]
+        assert isinstance(first, cls)
+        merged_agents = list(first.agents)
+        merged_models = dict(first.models)
+        include_self = first.include_self
+        for other in capabilities[1:]:
+            assert isinstance(other, cls)
+            for field_info in dataclasses.fields(first):
+                name = field_info.name
+                if name in _MERGEABLE_FIELDS or not field_info.compare or name == 'id':
+                    continue
+                mine, theirs = getattr(first, name), getattr(other, name)
+                if mine != theirs:
+                    raise UserError(
+                        f'Capability id {first.id!r} is used by multiple SubAgents capabilities that disagree '
+                        f'on {name!r} ({mine!r} and {theirs!r}). Only the roster is composed; everything else '
+                        "decides how the delegates run, so merging it would apply one set of delegates' "
+                        f'configuration to the other. Give them distinct `id`s to keep both, or make {name!r} '
+                        'agree.'
+                    )
+            merged_agents.extend(other.agents)
+            merged_models.update(other.models)
+            include_self = include_self or other.include_self
+
+        merged = replace_no_init(first, agents=merged_agents, models=merged_models, include_self=include_self)
+        merged._build_roster(first._disk_agents())
+        return merged

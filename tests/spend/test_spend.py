@@ -48,7 +48,10 @@ from pydantic_ai_harness.spend import (
     UnpricedModelWarning,
 )
 
-pytestmark = pytest.mark.anyio
+pytestmark = [
+    pytest.mark.anyio,
+    pytest.mark.filterwarnings('ignore::pydantic_ai_harness.HarnessDeprecationWarning'),
+]
 
 
 @pytest.fixture
@@ -75,13 +78,14 @@ class Clock:
 def _run_ctx(
     *,
     run_id: str | None = 'run-1',
+    run_step: int = 0,
     conversation_id: str | None = 'conv-1',
     deps: Any = None,
     trace_include_content: bool = False,
     tracer: Tracer | None = None,
     root_capability: AbstractCapability[None] | None = None,
 ) -> RunContext[Any]:
-    return RunContext(
+    ctx = RunContext(
         deps=deps,
         model=TestModel(),
         usage=RunUsage(),
@@ -90,7 +94,10 @@ def _run_ctx(
         trace_include_content=trace_include_content,
         tracer=tracer if tracer is not None else NoOpTracer(),
         root_capability=root_capability,
+        _event_stream_buffer=[],
     )
+    ctx.run_step = run_step
+    return ctx
 
 
 def _request_context() -> ModelRequestContext:
@@ -132,8 +139,12 @@ async def _record(
     async def handler(request_context: ModelRequestContext) -> ModelResponse:
         return recorded
 
+    run_ctx = ctx if ctx is not None else _run_ctx()
+    run_ctx._event_stream_buffer = []
+    run_ctx._capability = guard
+    run_ctx.capabilities = {'spend_limits': guard}
     return await guard.wrap_model_request(
-        ctx if ctx is not None else _run_ctx(),
+        run_ctx,
         request_context=_request_context(),
         handler=handler,
     )
@@ -320,8 +331,8 @@ class TestWindows:
 
     async def test_conversation_window_keys_on_the_conversation_id(self):
         guard = SpendLimits(budgets=[Budget(window='conversation')], price=lambda r: Decimal('1'))
-        await _record(guard, ctx=_run_ctx(conversation_id='c1'))
-        await _record(guard, ctx=_run_ctx(conversation_id='c1'))
+        await _record(guard, ctx=_run_ctx(run_id='r1', conversation_id='c1'))
+        await _record(guard, ctx=_run_ctx(run_id='r2', conversation_id='c1'))
 
         assert (await guard.status(_run_ctx(conversation_id='c1')))[0].spent.requests == 2
 
@@ -403,9 +414,9 @@ class TestScope:
             budgets=[Budget(usd=Decimal('1'), scope=lambda ctx: str(ctx.deps))],
             price=lambda r: Decimal('0.4'),
         )
-        await _record(guard, ctx=_run_ctx(deps='alice'))
-        await _record(guard, ctx=_run_ctx(deps='alice'))
-        await _record(guard, ctx=_run_ctx(deps='bob'))
+        await _record(guard, ctx=_run_ctx(run_id='r1', deps='alice'))
+        await _record(guard, ctx=_run_ctx(run_id='r2', deps='alice'))
+        await _record(guard, ctx=_run_ctx(run_id='r3', deps='bob'))
 
         assert (await guard.status(scope='alice'))[0].spent.usd == Decimal('0.8')
         assert (await guard.status(scope='bob'))[0].spent.usd == Decimal('0.4')
@@ -796,16 +807,16 @@ class TestCompositionWarning:
         await agent.run('hi')
 
     async def test_a_durable_execution_capability_is_not_reported(self):
-        """It routes the request into a durable unit rather than rejecting what comes back.
+        """A durability capability is excluded even though it wraps the model request.
 
         Core also requires its dispatch to be the innermost wrapper, so listing `SpendLimits`
-        after it is the one correction a reader must not make. What `SpendLimits` does not
-        support under a durable engine is reported separately, by refusing the workflow clock.
+        after it is the one correction a reader must not make. Durable capability operations pass
+        through outside a durable container, so the run completes and accrues normally.
         """
         pytest.importorskip('temporalio')
         from pydantic_ai.durable_exec.temporal import TemporalDurability  # noqa: PLC0415  # needs the temporal extra
 
-        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        guard = SpendLimits[None](budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
         agent = Agent(
             _scripted_usage(),
             name='durable',
@@ -813,7 +824,11 @@ class TestCompositionWarning:
             capabilities=[guard, TemporalDurability[None]()],
         )
 
-        await agent.run('hi')
+        with warnings.catch_warnings(record=True) as caught:
+            await agent.run('hi')
+            assert (await guard.status())[0].spent.usd == Decimal('1')
+
+        assert not [warning for warning in caught if isinstance(warning.message, SpendCompositionWarning)]
 
     async def test_a_capability_that_only_looks_durable_is_still_reported(self):
         """The exclusion matches the durability base type, not attributes anything could carry."""
@@ -1277,44 +1292,48 @@ class TestInMemoryStore:
     """The default store, and how it forgets."""
 
     async def test_an_unwritten_key_reads_as_zero(self):
-        assert await InMemorySpendStore().get('nothing') == Spent()
+        assert (await InMemorySpendStore().get_many(['nothing']))['nothing'] == Spent()
 
     async def test_a_lifetime_key_is_never_dropped(self):
         clock = Clock()
         store = InMemorySpendStore(clock=clock)
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=None)
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=None)])
         clock.advance(timedelta(days=999))
 
-        assert (await store.get('k')).usd == Decimal('1')
+        assert (await store.get_many(['k']))['k'].usd == Decimal('1')
 
     async def test_an_expired_key_is_dropped_on_access(self):
         clock = Clock()
         store = InMemorySpendStore(clock=clock)
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=1))])
         clock.advance(timedelta(hours=2))
 
-        assert await store.get('k') == Spent()
+        assert (await store.get_many(['k']))['k'] == Spent()
 
     async def test_a_rolled_over_key_is_swept_rather_than_kept(self):
         """A day key is never read again once the day turns, so only a sweep can drop it."""
         clock = Clock()
         store = InMemorySpendStore(clock=clock)
-        await store.add('monday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        await store.add_many(
+            [SpendEntry(key='monday', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=48))]
+        )
         clock.advance(timedelta(days=3))
 
-        await store.add('thursday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        await store.add_many(
+            [SpendEntry(key='thursday', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=48))]
+        )
 
         assert len(store) == 1
 
     async def test_expiring_a_key_on_read_happens_under_the_lock(self):
-        """`get` deletes the key it finds expired, which unlocked races the sweep inside `add`.
+        """`get_many` deletes the key it finds expired, which unlocked races the sweep inside `add_many`.
 
         Asserted through the lock rather than by racing threads: the interleaving that breaks
         it is real (`RuntimeError: dictionary changed size during iteration`) but not
         reproducible on demand, and a test that fails one run in fifty is not a regression test.
         """
         store = InMemorySpendStore(clock=(clock := Clock()))
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=1))])
         clock.advance(timedelta(hours=2))
         held: list[bool] = []
         real_lock = store._lock  # pyright: ignore[reportPrivateUsage]
@@ -1329,19 +1348,23 @@ class TestInMemoryStore:
 
         object.__setattr__(store, '_lock', _RecordingLock())
 
-        assert await store.get('k') == Spent()
+        assert (await store.get_many(['k']))['k'] == Spent()
         assert held == [True], 'the expiring read ran outside the lock'
 
     async def test_the_sweep_is_amortised_but_length_still_excludes_dead_keys(self):
         """A full scan under the lock on every write blocks the loop once the dict is large."""
         clock = Clock()
         store = InMemorySpendStore(clock=clock)
-        await store.add('monday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        await store.add_many(
+            [SpendEntry(key='monday', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=48))]
+        )
         clock.advance(timedelta(days=3))
-        await store.add('thursday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        await store.add_many(
+            [SpendEntry(key='thursday', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=48))]
+        )
 
         assert len(store) == 1
-        assert await store.get('monday') == Spent()
+        assert (await store.get_many(['monday']))['monday'] == Spent()
 
     async def test_dead_entries_are_physically_dropped_once_the_sweep_runs(self):
         """`__len__` hides dead entries either way, so residency is read by rewinding the clock.
@@ -1353,12 +1376,16 @@ class TestInMemoryStore:
         clock = Clock()
         store = InMemorySpendStore(clock=clock, sweep_every=4)
         for index in range(4):
-            await store.add(f'k{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+            await store.add_many(
+                [SpendEntry(key=f'k{index}', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=1))]
+            )
         clock.advance(timedelta(hours=2))
         assert len(store) == 0
 
         for index in range(4):
-            await store.add(f'n{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+            await store.add_many(
+                [SpendEntry(key=f'n{index}', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=1))]
+            )
 
         assert len(store) == 4
         clock.now = _EPOCH
@@ -1366,8 +1393,8 @@ class TestInMemoryStore:
 
     async def test_a_reconciler_may_post_a_negative_delta(self):
         store = InMemorySpendStore()
-        await store.add('k', usd=Decimal('5'), tokens=10, requests=1, unpriced=0, ttl=None)
-        corrected = await store.add('k', usd=Decimal('-2'), tokens=0, requests=0, unpriced=0, ttl=None)
+        await store.add_many([SpendEntry(key='k', usd=Decimal('5'), tokens=10, requests=1, ttl=None)])
+        corrected = (await store.add_many([SpendEntry(key='k', usd=Decimal('-2'), ttl=None)]))['k']
 
         assert corrected == Spent(usd=Decimal('3'), tokens=10, requests=1, unpriced_requests=0)
 
@@ -1558,30 +1585,32 @@ class TestRedisStore:
     """A counter several workers share, without a Redis dependency."""
 
     async def test_an_absent_hash_reads_as_zero(self):
-        assert await RedisSpendStore(FakeRedis()).get('k') == Spent()
+        assert (await RedisSpendStore(FakeRedis()).get_many(['k']))['k'] == Spent()
 
     @pytest.mark.parametrize('bytes_keys', [False, True])
     async def test_a_round_trip_keeps_the_exact_amount(self, bytes_keys: bool):
         client = FakeRedis(bytes_keys=bytes_keys)
         store = RedisSpendStore(client)
 
-        added = await store.add('k', usd=Decimal('0.000123456'), tokens=7, requests=1, unpriced=1, ttl=None)
+        added = (
+            await store.add_many([SpendEntry(key='k', usd=Decimal('0.000123456'), tokens=7, requests=1, unpriced=1)])
+        )['k']
         assert added == Spent(usd=Decimal('0.000123456'), tokens=7, requests=1, unpriced_requests=1)
-        assert await store.get('k') == added
+        assert (await store.get_many(['k']))['k'] == added
 
     async def test_repeated_adds_do_not_drift(self):
         """A price with a fractional sub-unit, since a whole one cannot detect rounding at all."""
         store = RedisSpendStore(FakeRedis())
         price = Decimal('0.000000675')  # a cheap model's real per-request cost
         for _ in range(100_000):
-            await store.add('k', usd=price, tokens=0, requests=1, unpriced=0, ttl=None)
+            await store.add_many([SpendEntry(key='k', usd=price, requests=1)])
 
-        assert (await store.get('k')).usd == price * 100_000
+        assert (await store.get_many(['k']))['k'].usd == price * 100_000
 
     async def test_a_ttl_is_applied_and_the_key_is_namespaced(self):
         client = FakeRedis()
         store = RedisSpendStore(client, prefix='acme')
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=2))
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=2))])
 
         assert client.expiries == {'{acme}:k': 7200}
 
@@ -1616,7 +1645,7 @@ class TestRedisStore:
     async def test_a_response_is_one_round_trip_and_one_unit_of_work(self):
         """Split across commands, a failure between them leaves a window holding part of a response."""
         client = FakeRedis()
-        await RedisSpendStore(client).add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=None)
+        await RedisSpendStore(client).add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1)])
 
         assert len(client.calls) == 1
         assert 'HINCRBY' in client.calls[0]
@@ -1659,10 +1688,10 @@ class TestRedisStore:
         client.hashes['{pydantic-ai-harness:spend}:k'] = {'usd_nanos': 2**53, 'tokens': 0, 'requests': 0, 'unpriced': 0}
         store = RedisSpendStore(client)
 
-        added = await store.add('k', usd=Decimal('0.000000001'), tokens=0, requests=1, unpriced=0, ttl=None)
+        added = (await store.add_many([SpendEntry(key='k', usd=Decimal('0.000000001'), requests=1)]))['k']
 
         assert added.usd == Decimal('9007199.254740993')
-        assert (await store.get('k')).usd == Decimal('9007199.254740993')
+        assert (await store.get_many(['k']))['k'].usd == Decimal('9007199.254740993')
 
     async def test_a_repeated_token_is_applied_once(self):
         """A durable engine re-executing the accrual hands back the same response."""
@@ -1728,7 +1757,7 @@ class TestRedisStore:
         client = FakeRedis()
         client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 3_000_000_000, 'tokens': 8, 'requests': 2}
 
-        assert await RedisSpendStore(client).get('k') == Spent(usd=Decimal('3'), tokens=8, requests=2)
+        assert (await RedisSpendStore(client).get_many(['k']))['k'] == Spent(usd=Decimal('3'), tokens=8, requests=2)
 
     async def test_a_counter_written_before_the_hash_tag_is_added_to_the_one_after_it(self):
         """The old name is read alongside the new one, so an upgrade counts both."""
@@ -1739,7 +1768,7 @@ class TestRedisStore:
         totals = await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1)])
 
         assert totals == {'k': Spent(usd=Decimal('4'), tokens=9, requests=3)}
-        assert await store.get('k') == Spent(usd=Decimal('4'), tokens=9, requests=3)
+        assert (await store.get_many(['k']))['k'] == Spent(usd=Decimal('4'), tokens=9, requests=3)
 
     async def test_the_old_counter_is_never_added_twice(self):
         """Summed rather than moved, so repeating the read cannot repeat the amount."""
@@ -1765,7 +1794,7 @@ class TestRedisStore:
 
         client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 2_000_000_000, 'requests': 1}
 
-        assert await store.get('k') == Spent(usd=Decimal('3'), requests=2)
+        assert (await store.get_many(['k']))['k'] == Spent(usd=Decimal('3'), requests=2)
         totals = await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
         assert totals == {'k': Spent(usd=Decimal('4'), requests=3)}
 
@@ -1812,7 +1841,9 @@ class TestRedisStore:
     async def test_a_horizon_is_rounded_up_never_down(self, retain: timedelta, expected: int):
         """`EXPIRE` takes seconds and the script reads zero as "keep"; rounding down would never expire."""
         client = FakeRedis()
-        await RedisSpendStore(client).add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=retain)
+        await RedisSpendStore(client).add_many(
+            [SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=retain)]
+        )
 
         assert client.expiries == {'{pydantic-ai-harness:spend}:k': expected}
 
@@ -1826,10 +1857,10 @@ class TestRedisStore:
         """
         client = FakeRedis()
         store = RedisSpendStore(client)
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=timedelta(hours=1))])
         assert client.expiries == {'{pydantic-ai-harness:spend}:k': 3600}
 
-        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=None)
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1, ttl=None)])
 
         assert client.expiries == {}
         assert 'PERSIST' in client.calls[-1]
@@ -1901,7 +1932,7 @@ class _LegacyStore:
         self._counters = InMemorySpendStore()
 
     async def get(self, key: str) -> Spent:
-        return await self._counters.get(key)
+        return (await self._counters.get_many([key]))[key]
 
     async def add(
         self,
@@ -1914,7 +1945,8 @@ class _LegacyStore:
         ttl: timedelta | None,
     ) -> Spent:
         self.writes.append(key)
-        return await self._counters.add(key, usd=usd, tokens=tokens, requests=requests, unpriced=unpriced, ttl=ttl)
+        entry = SpendEntry(key=key, usd=usd, tokens=tokens, requests=requests, unpriced=unpriced, ttl=ttl)
+        return (await self._counters.add_many([entry]))[key]
 
 
 class TestBatchAccrual:
@@ -1962,22 +1994,22 @@ class TestBatchAccrual:
 class TestIdempotentAccrual:
     """A durable engine re-executes the hooks around a response it already holds."""
 
-    async def test_a_response_the_provider_identified_survives_a_new_run_id(self):
-        """DBOS recovery and a Prefect flow retry replay the response under a fresh `run_id`."""
+    async def test_a_response_from_a_different_run_is_not_deduplicated(self):
+        """The run identity prevents equal provider responses in separate runs from colliding."""
         guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
         response = _response(provider_response_id='resp-1')
 
         await _record(guard, ctx=_run_ctx(run_id='first'), response=response)
         await _record(guard, ctx=_run_ctx(run_id='second'), response=response)
 
-        assert (await guard.status())[0].spent == Spent(usd=Decimal('1'), tokens=1100, requests=1)
+        assert (await guard.status())[0].spent == Spent(usd=Decimal('2'), tokens=2200, requests=2)
 
-    async def test_a_response_with_no_provider_id_needs_a_stable_run_id(self):
-        """The documented limit: without a response id the token falls back to the run's own.
+    async def test_the_same_response_position_needs_a_stable_run_id(self):
+        """The run identity is part of the token whether or not the provider reports an id.
 
         `_agent_graph.resolve_run_id` honours a `run_id` the caller passes, which is how a
-        replayed accrual stays idempotent for a provider that reports none. A fresh id is a
-        different response as far as the token can tell.
+        replayed accrual stays idempotent. A fresh id is a different response as far as the
+        token can tell, which prevents equal responses from separate runs colliding.
         """
         guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
         response = _response()
@@ -1998,25 +2030,62 @@ class TestIdempotentAccrual:
         """
         guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
 
-        for _ in range(3):
-            await _record(guard, response=_response(provider_response_id=''))
+        for step in range(3):
+            await _record(guard, ctx=_run_ctx(run_step=step), response=_response(provider_response_id=''))
 
         assert (await guard.status())[0].spent.requests == 3
 
     async def test_a_provider_that_repeats_one_id_does_not_collapse_its_responses(self):
-        """The response timestamp joins the id, so a broken id does not stand alone.
+        """The response digest and run step mean a broken id does not stand alone.
 
         A server returning a constant `id` would otherwise have everything after the first
         response dropped as a replay of it, which is spend the ceiling never sees. A genuine
-        replay hands back the response object it checkpointed, so its timestamp is unchanged
-        and `test_a_response_the_provider_identified_survives_a_new_run_id` still holds.
+        replay retains the response's run position and therefore retains the same token.
         """
         guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
 
-        for _ in range(3):
-            await _record(guard, response=_response(provider_response_id='resp-const'))
+        for step in range(3):
+            await _record(guard, ctx=_run_ctx(run_step=step), response=_response(provider_response_id='resp-const'))
 
         assert (await guard.status())[0].spent.requests == 3
+
+    async def test_non_serializable_metadata_does_not_prevent_accrual(self):
+        """Provider bookkeeping is not part of the replay identity."""
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        response = _response(provider_response_id='resp-1')
+        response.metadata = {'sentinel': object()}
+        response.provider_details = {'sentinel': object()}
+
+        await _record(guard, response=response)
+
+        assert (await guard.status())[0].spent.requests == 1
+
+    async def test_different_content_at_the_same_position_is_not_deduplicated(self):
+        """A repeated provider id does not hide a genuinely different response."""
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+
+        await _record(guard, response=_response(provider_response_id='resp-1'))
+        changed = _response(provider_response_id='resp-1')
+        changed.parts = [TextPart(content='different')]
+        await _record(guard, response=changed)
+
+        assert (await guard.status())[0].spent.requests == 2
+
+    async def test_scope_drift_reports_the_durable_execution_requirement(self):
+        """A replayed accrual can carry totals keyed by the original scope."""
+
+        class ReplayedAccrual(SpendLimits[str]):
+            async def _accrue(self, entries: list[SpendEntry]) -> Mapping[str, Spent]:
+                del entries
+                return {'tenant|3:day|10:2026-07-26|8:original': Spent(requests=1)}
+
+        guard = ReplayedAccrual(
+            budgets=[Budget(window='day', name='tenant', scope=lambda ctx: ctx.deps)],
+            price=lambda r: Decimal('1'),
+        )
+
+        with pytest.raises(UserError, match='returned a different value on replay'):
+            await _record(guard, ctx=_run_ctx(deps='changed'))
 
     async def test_two_responses_of_one_run_both_count(self):
         """The marker identifies a response, so it must not swallow the next one."""
@@ -2067,7 +2136,9 @@ class TestDeprecatedStore:
         assert len(warned) == 1
         message = str(warned[0].message)
         assert 'one window at a time' in message
-        assert 'removed in 0.28.0' in message
+        assert 'durable journal' in message
+        assert 'removed in' not in message
+        assert 'get_many' in message
 
     def test_a_batch_store_is_not_warned_about(self):
         with warnings.catch_warnings():
@@ -2181,6 +2252,52 @@ class TestUnreachableOverrides:
 
         with pytest.warns(HarnessDeprecationWarning, match='never called'):
             Mirrored(FakeRedis())
+
+
+class TestDeprecatedSingleKeyMethods:
+    """The concrete stores' single-key pair warns about itself (#688).
+
+    `SpendLimits` drives the batch pair, so the only caller that reaches `get` or `add` is an
+    application holding a concrete store and calling it by hand -- the caller nothing else
+    reaches.
+    """
+
+    async def test_in_memory_get_warns_and_still_reads(self):
+        store = InMemorySpendStore()
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
+
+        with pytest.warns(HarnessDeprecationWarning, match='`InMemorySpendStore.get`'):
+            assert (await store.get('k')).usd == Decimal('1')
+
+    async def test_in_memory_add_warns_and_still_applies(self):
+        store = InMemorySpendStore()
+
+        with pytest.warns(HarnessDeprecationWarning, match='`InMemorySpendStore.add`'):
+            added = await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=None)
+
+        assert added == Spent(usd=Decimal('1'), tokens=1, requests=1)
+
+    async def test_redis_get_warns_and_still_reads(self):
+        store = RedisSpendStore(FakeRedis())
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
+
+        with pytest.warns(HarnessDeprecationWarning, match='`RedisSpendStore.get`'):
+            assert (await store.get('k')).usd == Decimal('1')
+
+    async def test_redis_add_warns_and_still_applies(self):
+        store = RedisSpendStore(FakeRedis())
+
+        with pytest.warns(HarnessDeprecationWarning, match='`RedisSpendStore.add`'):
+            added = await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=None)
+
+        assert added == Spent(usd=Decimal('1'), tokens=1, requests=1)
+
+    async def test_the_warning_points_at_the_caller(self):
+        """`stacklevel=2` lands the warning on the line that called the method, not inside the store."""
+        with pytest.warns(HarnessDeprecationWarning) as warned:
+            await InMemorySpendStore().get('k')
+
+        assert warned[0].filename == __file__
 
 
 class TestReportedPrecision:
@@ -2556,9 +2673,9 @@ class TestDurableClock:
 
         guard = SpendLimits[None](budgets=[Budget(usd=Decimal('5'))], clock=restricted)
 
-        with pytest.raises(UserError, match='not safe to run inside a Temporal workflow'):
+        with pytest.raises(UserError, match='needs a durability capability'):
             await _gate(guard)
-        with pytest.raises(UserError, match='exhausted'):
+        with pytest.raises(UserError, match='TemporalDurability'):
             await guard.status()
 
     async def test_any_other_clock_failure_is_left_alone(self):
