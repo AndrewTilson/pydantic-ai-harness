@@ -1,6 +1,6 @@
 ---
 title: AWS Lambda Durability
-description: Checkpoint a Pydantic AI agent's model requests and tool calls into AWS Lambda durable steps.
+description: "Make a Pydantic AI agent durable on AWS Lambda durable functions: checkpoint model requests and tool calls so retried or timed-out invocations resume."
 ---
 
 # AWS Lambda Durability
@@ -18,10 +18,17 @@ checkpointing, a resumed run would repeat every model request and tool call.
 ## Installation
 
 ```bash
-pip install "pydantic-ai-harness[aws-lambda,bedrock]"
+pip/uv-add "pydantic-ai-harness[aws-lambda]"
 ```
 
 The AWS Durable Execution SDK requires Python 3.11 or newer.
+
+The quick start below uses a Bedrock provider model, which needs the Bedrock SDK from
+`pydantic-ai-slim[bedrock]`:
+
+```bash
+pip/uv-add "pydantic-ai-harness[aws-lambda]" "pydantic-ai-slim[bedrock]"
+```
 
 ## Quick start
 

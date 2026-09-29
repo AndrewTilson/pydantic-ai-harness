@@ -41,8 +41,16 @@ Editors like [Zed](https://zed.dev/docs/ai/external-agents) speak ACP: a stdio J
 
 ## Installation
 
+uv:
+
 ```bash
 uv add "pydantic-ai-harness[acp]"
+```
+
+pip:
+
+```bash
+pip install "pydantic-ai-harness[acp]"
 ```
 
 This pulls in the [`agent-client-protocol`](https://pypi.org/project/agent-client-protocol/) SDK. The rest of the harness does not depend on it -- only `pydantic_ai_harness.experimental.acp` does.
@@ -109,9 +117,9 @@ def session_config(session: AcpSession) -> AcpSessionConfig[None]:
     # Root file and shell tools at the workspace the client opened.
     return AcpSessionConfig(
         deps=None,
-        toolsets=[
-            FileSystem[None](root_dir=session.cwd).get_toolset(),
-            Shell[None](cwd=session.cwd).get_toolset(),
+        capabilities=[
+            FileSystem[None](root_dir=session.cwd),
+            Shell[None](cwd=session.cwd),
         ],
     )
 
@@ -120,7 +128,9 @@ if __name__ == '__main__':
     run_acp_stdio_sync(agent, session_config=session_config)
 ```
 
-The factory runs once per session with the client's [`AcpSession`][pydantic_ai_harness.experimental.acp.AcpSession] setup (its `cwd`, `mcp_servers`, and capabilities) and returns an [`AcpSessionConfig`][pydantic_ai_harness.experimental.acp.AcpSessionConfig] whose `deps` and `toolsets` apply to every run in that session. This is correct across multiple concurrent sessions in one process, where a single static `FileSystem` could not be.
+The factory runs once per session with the client's [`AcpSession`][pydantic_ai_harness.experimental.acp.AcpSession] setup (its `cwd`, `mcp_servers`, and capabilities) and returns an [`AcpSessionConfig`][pydantic_ai_harness.experimental.acp.AcpSessionConfig] whose `deps`, `capabilities`, and `toolsets` apply to every run in that session. This is correct across multiple concurrent sessions in one process, where a single static `FileSystem` could not be.
+
+Use `capabilities` for session behavior so hooks, instructions, ordering constraints, and capability event ownership are preserved. Keep `toolsets` for bare toolsets such as MCP servers. Session capabilities and toolsets are added to the agent's own configuration.
 
 ## Editor-native filesystem and shell (optional)
 
@@ -134,10 +144,12 @@ from pydantic_ai_harness.shell import Shell
 
 def session_config(session: AcpSession) -> AcpSessionConfig[None]:
     # Use the editor's filesystem/terminal when offered; otherwise fall back to local.
-    fs = acp_filesystem(session) or FileSystem[None](root_dir=session.cwd).get_toolset()
-    shell = acp_terminal(session) or Shell[None](cwd=session.cwd).get_toolset()
-    return AcpSessionConfig(deps=None, toolsets=[fs, shell])
+    fs = acp_filesystem(session) or FileSystem[None](root_dir=session.cwd)
+    shell = acp_terminal(session) or Shell[None](cwd=session.cwd)
+    return AcpSessionConfig(deps=None, capabilities=[fs, shell])
 ```
+
+Each helper returns a core `Toolset` capability wrapping the client-backed toolset. Pass it in `capabilities`, not `toolsets`. To use a bare toolset directly, construct `AcpFileSystemToolset` or `AcpTerminalToolset` instead. These wrappers add no telemetry spans; core already traces their tool calls.
 
 Each helper returns `None` when the client did not advertise the capability, so the `or` falls back to local and the agent works either way. The tool names match the local `FileSystem`/`Shell`, so rich rendering (next section) is identical. `acp_terminal` runs the command in the editor's environment and returns its captured output (see [Limitations](#cancellation-and-limitations)).
 
@@ -216,7 +228,7 @@ Each completed turn reports its token counts (input/output/total, plus cached to
 ## Cancellation and limitations
 
 - **Cancellation.** `session/cancel` and `session/close` cancel the in-flight turn; close waits for it to unwind before returning. Cooperative async tools stop promptly. A synchronous tool already running in a worker thread cannot be force-stopped, so its side effects may complete after the turn reports `cancelled` -- prefer async tools for cancellation-sensitive work.
-- **Approval detection.** Tools that require approval are recognized when they live in a `FunctionToolset` (which the harness `FileSystem`/`Shell` and `@agent.tool` both use). A tool whose approval requirement is decided dynamically per call (by raising `ApprovalRequired` from its body) starts as `in_progress`, and any side effects it ran *before* raising have already happened by the time the client is asked -- use an `ApprovalRequiredToolset` (which gates before the tool body runs) for actions that must not partially execute before approval.
+- **Approval detection.** Tools that require approval are recognized when they live in a `FunctionToolset` (which the harness `FileSystem`/`Shell` and `@agent.tool` both use). A tool whose approval requirement is decided dynamically per call (by raising `ApprovalRequired` from its body) starts as `in_progress`, and any side effects it ran *before* raising have already happened by the time the client is asked -- use an `ApprovalRequiredToolset` (which gates before the tool body runs) for actions that must not partially execute before approval. A tool added only per run (via a capability's `for_run()`, or the callable arm of an `AgentToolset`) is not recognized up front, but the run reports exactly which calls paused for approval, and the adapter corrects their announced status to `pending` before asking the client.
 - **Overwrite diffs.** `write_file` renders an overwrite as if creating a new file (no prior contents), so the diff understates what it replaced.
 - **Live terminal panes.** `acp_terminal` returns a command's captured output; it does not embed a *live* terminal pane in the tool call, which would need the terminal id at call-start, before the command runs.
 - **Images.** Prompt image blocks are off by default and must be enabled via `prompt_capabilities` with a model that accepts them (see [Prompt content types](#prompt-content-types)). The harness `FileSystem.read_file` is text-only, so the agent cannot open image files from the workspace itself.

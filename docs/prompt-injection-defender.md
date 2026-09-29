@@ -1,6 +1,6 @@
 ---
 title: Prompt Injection Defender
-description: Classify local tool results for indirect prompt injection using Defender by StackOne.
+description: "Scan a Pydantic AI agent's tool results (emails, tickets, web pages) for indirect prompt injection with StackOne Defender, and optionally block risky ones."
 ---
 
 # Prompt Injection Defender
@@ -21,7 +21,7 @@ to observe flagged verdicts.
 ## Installation
 
 ```bash
-uv add "pydantic-ai-harness[prompt-injection-defender]"
+pip/uv-add "pydantic-ai-harness[prompt-injection-defender]"
 ```
 
 The capability requires Python 3.11 or newer. The base extra provides pattern
@@ -30,7 +30,7 @@ content. To classify text under other fields, install the ML extra and enable
 `semantic_detection`:
 
 ```bash
-uv add "pydantic-ai-harness[prompt-injection-defender-ml]"
+pip/uv-add "pydantic-ai-harness[prompt-injection-defender-ml]"
 ```
 
 ```python

@@ -1,6 +1,6 @@
 ---
 title: Playwright Browser
-description: Give a Pydantic AI agent a real, stateful Chromium browser via async Playwright -- navigate, click, type, scroll, extract page text, run JavaScript, and screenshot JS-heavy or authenticated pages.
+description: "Give a Pydantic AI agent a real Chromium browser through Playwright to navigate, click, type, read, run JavaScript, and screenshot dynamic or logged-in pages."
 ---
 
 # Playwright Browser
@@ -32,8 +32,11 @@ The `playwright` extra pulls in Playwright, and Chromium is a separate binary
 download:
 
 ```bash
-uv add "pydantic-ai-harness[playwright]"
-playwright install chromium
+pip/uv-add "pydantic-ai-harness[playwright]"
+```
+
+```bash
+py-cli playwright install chromium
 ```
 
 If the Chromium binary is missing at runtime, the browser tool returns the

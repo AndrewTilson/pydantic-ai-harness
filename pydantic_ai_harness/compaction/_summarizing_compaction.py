@@ -23,6 +23,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
 
@@ -156,8 +157,39 @@ def _model_family(model: str | AbstractModel | None) -> str | None:
     return tail or None
 
 
-def _format_messages(messages: Sequence[ModelMessage], *, skip_previous_summary: bool = False) -> str:
-    """Render messages into a human-readable string for summarization."""
+def _writes_text(model: AbstractModel) -> bool:
+    """Whether *model* can answer with text, judged by the model a request reaches first.
+
+    A decision model such as TypeSafe's Jev answers only structured questions, so its profile
+    sets `supports_text_output=False`. `FallbackModel` has no profile of its own and tries its
+    first model first, which is where a text-less model would fail.
+    """
+    while isinstance(model, WrapperModel | FallbackModel):
+        model = model.models[0] if isinstance(model, FallbackModel) else model.wrapped
+    return not isinstance(model, Model) or model.profile.get('supports_text_output', True)
+
+
+def _truncate_with_marker(text: str, max_chars: int) -> str:
+    """Truncate *text* to *max_chars* characters, an explicit marker counted within the cap."""
+    if len(text) <= max_chars:
+        return text
+    marker = '[...]'
+    if max_chars <= len(marker):
+        return marker[:max_chars]
+    return f'{text[: max_chars - len(marker)]}{marker}'
+
+
+def _format_messages(
+    messages: Sequence[ModelMessage],
+    *,
+    skip_previous_summary: bool = False,
+    tool_return_max_chars: int | None = 500,
+) -> str:
+    """Render messages into a human-readable string for summarization.
+
+    Tool returns are truncated to `tool_return_max_chars` characters with the shared
+    truncation marker; `None` renders them whole.
+    """
     lines: list[str] = []
     for msg in messages:
         if isinstance(msg, ModelRequest):
@@ -171,9 +203,9 @@ def _format_messages(messages: Sequence[ModelMessage], *, skip_previous_summary:
                 ):
                     lines.append(f'System: {part.content}')
                 elif isinstance(part, ToolReturnPart):
-                    content_str = str(part.content)[:500]
-                    if len(str(part.content)) > 500:
-                        content_str += '...'
+                    content_str = str(part.content)
+                    if tool_return_max_chars is not None:
+                        content_str = _truncate_with_marker(content_str, tool_return_max_chars)
                     lines.append(f'Tool [{part.tool_name}]: {content_str}')
         else:
             for part in msg.parts:
@@ -309,6 +341,15 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     `RunContext`, never the outer run's, and the outer `Agent.run(...)` handler is not inherited.
     """
 
+    summarization_capabilities: Sequence[AbstractCapability[None]] = field(default=(), kw_only=True)
+    """Capabilities attached to the agent that writes the summary.
+
+    The summary runs on its own `Agent`, so capabilities on the outer agent do not run on it.
+    Capabilities listed here do, with every hook of that run.
+
+    The summary agent has no `deps`, so these are `AbstractCapability[None]`.
+    """
+
     max_messages: int | None = None
     """Trigger compaction when message count exceeds this value."""
 
@@ -395,6 +436,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """Per-message character cap for ``keep_user_messages``; oversized messages are truncated
     with an explicit marker (the shared truncation-marker convention)."""
 
+    tool_return_max_chars: int | None = field(default=500, kw_only=True)
+    """Per-return character cap when rendering tool results for the summarizer. `None` renders
+    them whole."""
+
     receipts: bool = False
     """When ``True``, append a deterministic compaction receipt after the summary noting how
     much history was summarized, that the summary is secondhand, and -- when a
@@ -420,6 +465,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
             raise ValueError('keep_tokens must be non-negative.')
         if self.keep_user_messages_max_chars < 1:
             raise ValueError('keep_user_messages_max_chars must be positive.')
+        if self.tool_return_max_chars is not None and self.tool_return_max_chars < 1:
+            raise ValueError('tool_return_max_chars must be positive.')
 
     def with_focus(self, focus: str) -> SummarizingCompaction[AgentDepsT]:
         """Return a copy whose summary prompt prioritizes `focus`.
@@ -525,12 +572,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
 
     def _truncate(self, text: str, max_chars: int | None = None) -> str:
         limit = self.keep_user_messages_max_chars if max_chars is None else max_chars
-        if len(text) <= limit:
-            return text
-        marker = '[...]'
-        if limit <= len(marker):
-            return marker[:limit]
-        return f'{text[: limit - len(marker)]}{marker}'
+        return _truncate_with_marker(text, limit)
 
     def _bound_sequence(self, content: Sequence[UserContent]) -> tuple[list[UserContent], bool]:
         """Apply the same per-part character budget to a sequence-shaped user prompt.
@@ -648,7 +690,11 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         """Generate a summary for the given messages using the configured model."""
         from pydantic_ai import Agent
 
-        formatted = _format_messages(messages, skip_previous_summary=previous_summary is not None)
+        formatted = _format_messages(
+            messages,
+            skip_previous_summary=previous_summary is not None,
+            tool_return_max_chars=self.tool_return_max_chars,
+        )
         prompt = self.summary_prompt.format(messages=formatted)
 
         if previous_summary is not None:
@@ -667,16 +713,28 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
                 f'the run uses {type(model).__name__}, which is not one. Set `model=` on '
                 'SummarizingCompaction to the model to summarize with when the run uses a realtime model.'
             )
+        # Without `model=`, the summarizer is the run's model, which may be one that cannot write
+        # text at all, such as a decision model. Say so here rather than letting the summary run
+        # fail on core's generic "text output is not supported".
+        if self.model is None and not _writes_text(ctx.model):
+            raise UserError(
+                f'SummarizingCompaction writes its summary with a language model, but the run uses '
+                f'{ctx.model.model_name!r}, which cannot produce text. Set `model=` on SummarizingCompaction '
+                'to a language model to summarize with.'
+            )
         # `isinstance` narrows the generic `Model` to `Model[Unknown]`; `cast` recovers
         # `Model[Any]`, mirroring core's own `reinject_system_prompt` idiom.
         agent: Agent[None, str] = Agent(
             cast('Model[Any] | str', model),
             name='summarizing_compaction',
+            deps_type=type(None),
             instructions=self.instructions,
             model_settings=self.model_settings,
+            capabilities=list(self.summarization_capabilities),
         )
         result = await agent.run(
             prompt,
+            conversation_id=ctx.conversation_id,
             usage=ctx.usage,
             usage_limits=reserved_usage_limits(ctx.usage_limits),
             event_stream_handler=self.event_stream_handler,

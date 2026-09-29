@@ -124,6 +124,7 @@ def _make_ctx(
         usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
+        conversation_id: str | None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
         # A declared field, like the real `RunContext`: a strategy reached from
         # `before_model_request` sees a context rebuilt for the request's model, and an
@@ -739,6 +740,14 @@ class TestCompaction:
         with pytest.raises(ValueError, match='keep_tokens must be non-negative'):
             SummarizingCompaction(model='test', max_messages=10, keep_tokens=-1)
 
+    def test_validation_bad_tool_return_max_chars(self):
+        with pytest.raises(ValueError, match='tool_return_max_chars must be positive'):
+            SummarizingCompaction(model='test', max_messages=10, tool_return_max_chars=0)
+
+    def test_tool_return_max_chars_none_is_accepted(self):
+        comp = SummarizingCompaction(model='test', max_messages=10, tool_return_max_chars=None)
+        assert comp.tool_return_max_chars is None
+
     @pytest.mark.anyio
     async def test_no_compaction_below_threshold(self):
         comp = SummarizingCompaction(model='test', max_messages=100)
@@ -937,7 +946,18 @@ class TestFormatMessages:
     def test_long_tool_return_truncated(self):
         msgs: list[ModelMessage] = [_tool_return('fn', 'tc1', 'x' * 600)]
         text = _format_messages(msgs)
-        assert '...' in text
+        # Default cap of 500, marker counted within the cap, like kept user turns.
+        assert text == 'Tool [fn]: ' + 'x' * 495 + '[...]'
+
+    def test_tool_return_custom_max_chars(self):
+        msgs: list[ModelMessage] = [_tool_return('fn', 'tc1', 'x' * 600)]
+        text = _format_messages(msgs, tool_return_max_chars=10)
+        assert text == 'Tool [fn]: ' + 'x' * 5 + '[...]'
+
+    def test_tool_return_none_renders_full(self):
+        msgs: list[ModelMessage] = [_tool_return('fn', 'tc1', 'x' * 600)]
+        text = _format_messages(msgs, tool_return_max_chars=None)
+        assert text == 'Tool [fn]: ' + 'x' * 600
 
 
 # ---------------------------------------------------------------------------
@@ -2432,6 +2452,73 @@ class TestPublicPath:
         return 'asyncio'
 
     @pytest.mark.anyio
+    async def test_summary_run_belongs_to_the_compacted_conversation(self):
+        summary_conversations: set[str | None] = set()
+
+        def summarize(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            summary_conversations.update(m.conversation_id for m in messages)
+            return ModelResponse(parts=[TextPart(content='the summary')])
+
+        history: list[ModelMessage] = []
+        for i in range(5):
+            history += [_user(f'q{i}'), _assistant(f'a{i}')]
+        agent = Agent(
+            TestModel(),
+            capabilities=[
+                SummarizingCompaction(
+                    FunctionModel(summarize), max_messages=4, keep_messages=1, preserve_first_user_message=False
+                )
+            ],
+        )
+
+        result = await agent.run('next', message_history=history, conversation_id='conversation-1')
+
+        assert result.conversation_id == 'conversation-1'
+        assert summary_conversations == {'conversation-1'}
+
+    @pytest.mark.anyio
+    async def test_summarization_capabilities_run_on_the_summary_run(self):
+        @dataclasses.dataclass
+        class RecordModels(AbstractCapability[None]):
+            models: list[str | None] = dataclasses.field(default_factory=list[str | None])
+
+            async def after_model_request(
+                self, ctx: RunContext[None], *, request_context: ModelRequestContext, response: ModelResponse
+            ) -> ModelResponse:
+                self.models.append(response.model_name)
+                return response
+
+        outer, summary = RecordModels(), RecordModels()
+        summarizer = FunctionModel(
+            lambda _messages, _info: ModelResponse(parts=[TextPart(content='the summary')]),
+            model_name='summarizer',
+        )
+        history: list[ModelMessage] = []
+        for i in range(5):
+            history += [_user(f'q{i}'), _assistant(f'a{i}')]
+        agent = Agent(
+            TestModel(),
+            deps_type=type(None),
+            capabilities=[
+                outer,
+                SummarizingCompaction(
+                    summarizer,
+                    max_messages=4,
+                    keep_messages=1,
+                    preserve_first_user_message=False,
+                    summarization_capabilities=[summary],
+                ),
+            ],
+        )
+
+        await agent.run('next', message_history=history)
+
+        # The summary run's own requests reach the capability attached to it, and only those:
+        # the outer agent's capabilities never see a request made by a separate `Agent`.
+        assert summary.models == ['summarizer']
+        assert outer.models == ['test']
+
+    @pytest.mark.anyio
     async def test_capabilities_wired_into_agent(self):
 
         agent = Agent(
@@ -2648,6 +2735,28 @@ class TestCompactionSpan:
         # A full agent.run only needs the asyncio backend; trio hits a TestModel
         # event-loop quirk in core unrelated to compaction.
         return 'asyncio'
+
+    @pytest.mark.anyio
+    @pytest.mark.usefixtures('instrument_all_agents')
+    async def test_summary_run_spans_carry_the_parent_conversation_id(self, capfire: CaptureLogfire) -> None:
+        history: list[ModelMessage] = []
+        for i in range(5):
+            history += [_user(f'q{i}'), _assistant(f'a{i}')]
+        summarizer = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart(content='the summary')]))
+        agent = Agent(
+            TestModel(),
+            name='outer',
+            capabilities=[
+                SummarizingCompaction(summarizer, max_messages=4, keep_messages=1, preserve_first_user_message=False)
+            ],
+        )
+
+        await agent.run('next', message_history=history, conversation_id='conversation-1')
+
+        spans = capfire.exporter.exported_spans_as_dict()
+        summary_run = next(s for s in spans if s['attributes'].get('agent_name') == 'summarizing_compaction')
+        assert summary_run['attributes']['gen_ai.conversation.id'] == 'conversation-1'
+        assert 'baggage_conflict.gen_ai.conversation.id' not in summary_run['attributes']
 
     @pytest.mark.anyio
     async def test_span_emitted_when_threshold_exceeded(self, capfire: CaptureLogfire) -> None:
@@ -3917,6 +4026,59 @@ class TestStructuralFeaturesThroughAgent:
             if isinstance(message, ModelRequest)
             for part in message.parts
         )
+
+    @pytest.mark.anyio
+    async def test_tool_return_max_chars_threads_through_summarize(self):
+        """The field reaches `_format_messages` via `_summarize` in a real run."""
+        prompts: list[str] = []
+        agent = Agent(
+            _recording_model([]),
+            capabilities=[
+                SummarizingCompaction(
+                    model=_recording_summarizer(prompts),
+                    max_messages=3,
+                    keep_messages=1,
+                    tool_return_max_chars=10,
+                )
+            ],
+        )
+        await agent.run(
+            'go',
+            message_history=[
+                _tool_call('read', 'c1'),
+                _tool_return('read', 'c1', 'z' * 600),
+                _assistant('b'),
+                _user('recent'),
+            ],
+        )
+        assert len(prompts) == 1
+        assert f'Tool [read]: {"z" * 5}[...]' in prompts[0]
+
+    @pytest.mark.anyio
+    async def test_tool_return_max_chars_none_renders_whole_return(self):
+        prompts: list[str] = []
+        agent = Agent(
+            _recording_model([]),
+            capabilities=[
+                SummarizingCompaction(
+                    model=_recording_summarizer(prompts),
+                    max_messages=3,
+                    keep_messages=1,
+                    tool_return_max_chars=None,
+                )
+            ],
+        )
+        await agent.run(
+            'go',
+            message_history=[
+                _tool_call('read', 'c1'),
+                _tool_return('read', 'c1', 'z' * 600),
+                _assistant('b'),
+                _user('recent'),
+            ],
+        )
+        assert len(prompts) == 1
+        assert f'Tool [read]: {"z" * 600}' in prompts[0]
 
     @pytest.mark.anyio
     async def test_summary_events_reach_a_caller_supplied_handler(self):

@@ -35,6 +35,15 @@ reduces both with the same band logic (they spill to distinct handles). Text `co
 reduced in place; non-text `content` (multimodal parts) that overflows is left unreduced with
 a `warnings.warn`, since it cannot be safely truncated.
 
+### `ToolReturn.metadata` is preserved
+
+Spill keys (`overflow_handle`, `overflow_bytes`, `overflow_content_handle`) live in
+`ToolReturn.metadata` alongside whatever the tool put there. A pre-existing mapping is copied
+in with stringified keys; a pre-existing non-mapping value (a string, a dataclass, anything
+that is not a `Mapping`) is kept under `original_metadata` rather than dropped. Either way the
+caller's own metadata survives a spill and is readable from `metadata` on the resulting
+`ToolReturnPart` after `Agent.run`.
+
 ## Bands: combine the modes
 
 Configure an ordered list of size `bands`. Each band is a `(over, action)` pair: when a
@@ -97,6 +106,37 @@ agent = Agent(
     ],
 )
 ```
+
+### Prefer complete tail lines
+
+Set `Truncate(keep_tail_lines=N)` to reserve the final N lines before allocating the rest of
+the character budget. The default is zero, which leaves existing truncation behavior unchanged.
+
+```python
+from pydantic_ai_harness.tool_output_limits import Band, ToolOutputLimits, Truncate, TruncationStrategy
+
+truncate = Truncate(max_chars=4_000, strategy=TruncationStrategy.head, keep_tail_lines=2)
+limits = ToolOutputLimits(bands=[], per_tool={'run_command': [Band(over=4_000, action=truncate)]})
+```
+
+With `head`, the remaining content budget keeps the beginning of the output. With
+`head_tail`, it is split 2:3 between the beginning and the text immediately before the
+reserved lines. `tail` continues to keep the end. Markers and all retained characters count
+toward `max_chars`.
+
+The cap takes priority. If the requested lines exceed it, truncation falls back to the
+usual tail strategy; if they fit but a full marker would displace them, the result is a
+bare tail slice within the cap. This does not invoke `then` or guarantee that an oversized
+control trailer remains intact.
+
+Lines are separated by LF or CRLF, and their existing endings are retained. A terminating
+newline does not add a line, but a blank final line counts. Requesting more lines than exist
+selects the whole text, subject to the same cap. Negative `keep_tail_lines` values are rejected.
+
+This applies to the text after serialization and optional ANSI stripping, independently
+for `ToolReturn.return_value` and textual `content`. Binary fallbacks are unchanged.
+Tail-line selection adds no telemetry spans: it is a slicing choice within the existing
+tool-result reduction, rather than a separate operation.
 
 ## Layering with Shell
 
@@ -251,7 +291,7 @@ for path in root.rglob('*'):
 A built-in `Summarize` call is a real request to the model, so its full usage -- tokens and the
 request itself -- folds into the run's `ctx.usage`, exactly like `SummarizingCompaction`. Its nested
 run receives the parent limits unchanged except that a finite request limit reserves one request for
-the pending parent request.
+the pending parent request, and is filed under the parent run's `conversation_id`.
 
 By default `Summarize` inherits the running agent's model (`ctx.model`). Pass a model id or
 instance to `Summarize(model=...)` to override, or a `summarize` callable to bypass the

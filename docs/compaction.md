@@ -1,11 +1,11 @@
 ---
 title: Compaction
-description: A menu of strategies -- clear, dedupe, trim, or summarize -- for keeping an agent's conversation history within the model's context window.
+description: "Keep a long Pydantic AI agent run within the context window on any model: clear old tool results, trim, or summarize history, with tiered escalation."
 ---
 
 # Compaction
 
-Compaction is a menu of strategies for keeping an agent's conversation history within a model's context window. Most are Pydantic AI `Capability` classes that edit the message history just before each request goes out. `FallbackCompaction` is instead a composing `CompactionStrategy` used through `TieredCompaction` or `compact_now`; it has no request trigger of its own. The edits **persist** into the run's message history, so a trim, clear, or summary carries forward to later steps -- it is not recomputed from the full history every turn.
+Compaction is a menu of strategies for keeping an agent's conversation history within a model's context window. These Pydantic AI `Capability` classes edit the message history just before each request goes out. `FallbackCompaction` optionally triggers its chain at a token threshold and also works as a composing `CompactionStrategy`. The edits **persist** into the run's message history, so a trim, clear, or summary carries forward to later steps -- it is not recomputed from the full history every turn.
 
 All strategies preserve tool-call / tool-return **pairing**. Core does not validate this, and a provider rejects an orphaned pair, so the pairing guarantee is what makes these safe to drop into an agent. The zero-LLM strategies never call a model; only `SummarizingCompaction` (and `TieredCompaction` when it escalates that far) spends tokens.
 
@@ -57,13 +57,13 @@ agent = Agent(
 
 That compacts at 900K on a 1M model and at 115K on a 128K one. `WarnNearLimits` takes the same shape as `max_context_fraction`, and `TieredCompaction` as `target_fraction`. `max_tokens` and `max_fraction` are mutually exclusive -- a strategy taking both would have to pick one and discard the other, leaving the caller unable to tell which budget was in force.
 
-The window comes from [`genai-prices`](https://github.com/pydantic/genai-prices), already a dependency of `pydantic-ai-slim`; `resolve_context_window` is exported if you want the number yourself. Pydantic AI does not expose it yet (`ModelProfile` has no `context_window` field), so when it does, that one function switches over. Nothing is cached: only a registry-confirmed number is ever treated as the real window.
+The window is the model's own [`context_window`](https://pydantic.dev/docs/ai/models/overview/#inspecting-a-models-profile): the value its profile sets, including one you pass as `profile={'context_window': ...}`, filled from [`genai-prices`](https://github.com/pydantic/genai-prices) when no profile does. A `FallbackModel` reports the smallest window among its models, since any of them may answer. `resolve_context_window` is exported if you want the number yourself. Nothing is cached: only a window the model or the registry states is ever treated as the real one.
 
 The model consulted is `ModelRequestContext.model`, the one the request will be sent to, not the one the run started with. A capability ordered earlier may replace it, and the budget follows.
 
 ### When the window does not resolve
 
-Not every model is in the registry. A local endpoint, a bespoke deployment, a Bedrock-prefixed reference such as `bedrock:us.anthropic.claude-sonnet-5`, a model the registry knows without a recorded window, and any `FallbackModel` (its `model_id` is a composite `fallback:...`) all resolve to nothing. The fraction is then taken of `fallback_context_window`, which defaults to a conservative 200K (`DEFAULT_CONTEXT_WINDOW`): compacting earlier than necessary costs one summary, overestimating costs the whole request.
+Not every model has a known window. A local endpoint, a bespoke deployment, a model the registry knows without a recorded window, and a `FallbackModel` none of whose models has a window all resolve to nothing. The fraction is then taken of `fallback_context_window`, which defaults to a conservative 200K (`DEFAULT_CONTEXT_WINDOW`): compacting earlier than necessary costs one summary, overestimating costs the whole request.
 
 Every capability that takes a fraction takes the fallback too, so you are not stuck with 200K on a model you know the size of:
 
@@ -72,8 +72,8 @@ from pydantic_ai import Agent
 from pydantic_ai_harness import SummarizingCompaction
 
 agent = Agent(
-    'bedrock:us.anthropic.claude-sonnet-5',
-    capabilities=[SummarizingCompaction(max_fraction=0.9, fallback_context_window=1_000_000)],
+    'ollama:qwen3',
+    capabilities=[SummarizingCompaction(max_fraction=0.9, fallback_context_window=40_000)],
 )
 ```
 
@@ -174,6 +174,8 @@ history = await compact_now(
 
 A compaction that changes the history emits the same `compact_messages` span the in-run path emits, so an instrumented application sees one shape however compaction was triggered. Pass `tracer=` to record it; without one the span goes to a no-op tracer.
 
+Pass `conversation_id=` with the id of the conversation being compacted. It is set on the throwaway context, so the summary run of `SummarizingCompaction` is recorded under that conversation (its messages and its `gen_ai.conversation.id` span attribute) rather than under a fresh id of its own. Inside a run, the summary run takes the parent run's `conversation_id` without this.
+
 ## The recommended default: `TieredCompaction`
 
 The field consensus (Anthropic, OpenCode, Letta) is to clear and dedupe first, and summarize only when that is not enough. Summarization turns input tokens into output tokens, which are billed at a premium and generated serially, so it is genuinely expensive. The zero-LLM strategies touch only the cheaper input side.
@@ -213,12 +215,13 @@ A tier inside `TieredCompaction` is driven directly by the orchestrator, which r
 
 `TieredCompaction` advances when a successful tier does not reclaim enough. `FallbackCompaction` advances only when a strategy raises an exception selected by `fallback_on`, which defaults to Pydantic AI's `ModelAPIError` and `FallbackExceptionGroup`. The latter is raised when every model in a `FallbackModel` fails. Each attempt receives a fresh list containing the original message objects, so list-level changes by a failed strategy do not affect its fallback. Strategies must still honor the `CompactionStrategy` contract and avoid mutating message objects. If every strategy fails, the last exception is re-raised. Non-matching exceptions, cancellation, and other `BaseException` subclasses pass through immediately; `fallback_on` rejects types that do not derive from `Exception`.
 
-Use it as a tier when summarization should fall back to deterministic truncation:
+Register it directly when summarization should fall back to deterministic truncation:
 
 ```python
 from pydantic_ai_harness import FallbackCompaction, SlidingWindowCompaction, SummarizingCompaction
 
 fallback = FallbackCompaction(
+    max_fraction=0.85,
     fallback_chain=[
         SummarizingCompaction(max_messages=1, keep_tokens=20_000),
         SlidingWindowCompaction(max_messages=1, keep_tokens=20_000),
@@ -226,7 +229,17 @@ fallback = FallbackCompaction(
 )
 ```
 
-The strategies' trigger fields are not consulted when a composing strategy calls `compact` directly. Put `fallback` inside `TieredCompaction` to give the chain a context trigger, or pass it to `compact_now` for manual compaction.
+Register `fallback` directly with `Agent(..., capabilities=[fallback])`. Its optional
+`max_tokens` or `max_fraction` trigger runs the chain only when estimated context tokens
+exceed the threshold. Fractions resolve against the request's model; `context_window`
+overrides its window and `fallback_context_window` supplies an unknown model's window.
+`tokenizer` customizes token estimation. The hook preserves pinned parts and persists
+compacted history, emitting the standard `compact_messages` span when history changes.
+
+With neither trigger configured, the request hook does nothing. Direct `compact()` and
+`compact_now()` calls run the chain regardless of its threshold, so it remains usable
+inside other composing strategies and for manual compaction. Each child's own trigger
+is bypassed when the chain calls its `compact()` method.
 
 ## `ClampOversizedMessages`: surviving a runaway generation
 
@@ -346,9 +359,11 @@ agent = Agent(
 )
 ```
 
-`model` accepts a model name or a `Model`; when left `None` it inherits the running agent's model. Its nested summary run inherits the parent usage limits and reserves one request from a finite request limit for the pending parent request. Pass `model_settings` to give the dedicated summary call settings that differ from defaults carried by that model; the supplied settings merge over the model defaults without mutating the model or the settings dictionary. By default `incremental=True` updates the newest existing summary as an anchor. This changes the summary-call prompt from earlier releases; set `incremental=False` to retain the prior regeneration behavior.
+`model` accepts a model name or a `Model`; when left `None` it inherits the running agent's model. That model has to write text, so an agent running a model that can't, such as a decision model like TypeSafe's Jev, needs `model=` set to a language model; without it, the first compaction raises a `UserError` saying so. Its nested summary run inherits the parent usage limits and reserves one request from a finite request limit for the pending parent request. Pass `model_settings` to give the dedicated summary call settings that differ from defaults carried by that model; the supplied settings merge over the model defaults without mutating the model or the settings dictionary. Pass `summarization_capabilities` to attach capabilities to the summary agent; capabilities on the outer agent do not run on the summary call. By default `incremental=True` updates the newest existing summary as an anchor. This changes the summary-call prompt from earlier releases; set `incremental=False` to retain the prior regeneration behavior.
 
 Both prompt surfaces of the summary request are fields: `summary_prompt` is the user-turn template (it must contain a `{messages}` placeholder), and `instructions` sets the internal agent's static instructions, which Pydantic AI sends in the request's system prompt. Override `instructions` when the summarizer endpoint requires a fixed leading instruction.
+
+The messages served into that template are rendered to text, and each tool return is capped per return at `tool_return_max_chars` (default 500) characters using the same explicit truncation marker as kept user turns. Raise it, or set it to `None` to render each return whole, when the summarizer's context window is large enough to absorb the payloads. `max_tokens` and `keep_tokens` control when compaction runs and which history messages are retained; they do not cap the summary-request payload.
 
 The summary request is non-streaming unless `event_stream_handler` is set. Supply a handler to watch the summary as it is written, or pass `drain_summary_events` to take the streaming request path without handling the events -- which is what a summarizer endpoint that rejects non-streaming requests needs:
 
@@ -368,7 +383,7 @@ Neither transport works everywhere, which is why this is a choice rather than a 
 
 ### Usage accounting
 
-The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. The nested run receives the other parent limits unchanged; the finite request limit is reduced by one so it cannot spend the slot already approved for the parent request. A run-request or iteration limiter will therefore see compaction calls among its requests.
+The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. The nested run receives the other parent limits unchanged; the finite request limit is reduced by one so it cannot spend the slot already approved for the parent request. The summary run is filed under the parent run's `conversation_id`, so its requests, spans, and cost group with the conversation it compacts. A run-request or iteration limiter will therefore see compaction calls among its requests.
 
 With a durable-execution capability attached, the summary call runs as a contributed durable
 operation, so replay uses the recorded summary instead of calling the model again. When `model` is
@@ -487,7 +502,7 @@ As with receipts, the update instruction and the bridge-prefix wording are conte
 
 ## Out of scope
 
-These strategies compress or drop context *inside* the window. Moving large tool outputs *out* of the window -- overflowing them to a file the agent (or a subagent) can query on demand -- is a separate capability ([tool output limits](tool-output-limits.md)), not lossy truncation. Prefer it over capping individual tool outputs.
+These strategies compress or drop context *inside* the window. Moving large tool outputs *out* of the window -- overflowing them to a file the agent (or a subagent) can query on demand -- is a separate capability ([tool output limits](tool-output-limits.md)), not lossy truncation. Within `SummarizingCompaction`, `tool_return_max_chars` makes the summarizer's per-return cap tunable (or `None` to render returns whole), but the summary request still reads a lossy rendering; prefer tool output limits when a payload must be queryable in full.
 
 ## API reference
 

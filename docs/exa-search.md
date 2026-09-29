@@ -1,6 +1,6 @@
 ---
 title: Exa Search
-description: Give a Pydantic AI agent web research tools backed by the Exa search API -- search with relevant excerpts and optional synthesized text summaries, full-page retrieval, opt-in deep search, and deferred Exa agent runs.
+description: "Give a Pydantic AI agent Exa web search: relevant excerpts per result, full-page reads, opt-in deep search with cited answers, and Exa Agent research runs."
 ---
 
 # Exa Search
@@ -35,7 +35,7 @@ Install the `exa` extra and set the `EXA_API_KEY` environment variable (create
 a key at <https://dashboard.exa.ai>):
 
 ```bash
-uv add "pydantic-ai-harness[exa]"
+pip/uv-add "pydantic-ai-harness[exa]"
 ```
 
 Then pass `ExaSearch` to an `Agent` via the `capabilities` parameter:

@@ -374,7 +374,10 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             if unit.binary:
                 return await self._fallback(ctx, call, action.then, unit)
             assert unit.text is not None
-            return truncate_text(unit.text, action.max_chars, action.strategy), None
+            return (
+                truncate_text(unit.text, action.max_chars, action.strategy, keep_tail_lines=action.keep_tail_lines),
+                None,
+            )
 
         if isinstance(action, Spill):
             return await self._spill(ctx, call, action, unit)
@@ -451,7 +454,12 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         agent: Agent[None, str] = Agent(
             model, name='tool_output_limits', instructions='You summarize oversized tool output.'
         )
-        run = await agent.run(prompt, usage=ctx.usage, usage_limits=reserved_usage_limits(ctx.usage_limits))
+        run = await agent.run(
+            prompt,
+            conversation_id=ctx.conversation_id,
+            usage=ctx.usage,
+            usage_limits=reserved_usage_limits(ctx.usage_limits),
+        )
         return run.output.strip()
 
     @staticmethod
@@ -549,6 +557,8 @@ def _with_handles(
     base: dict[str, object] = {}
     if _is_mapping(existing):
         base.update(_copy_mapping(existing))
+    elif existing is not None:
+        base['original_metadata'] = existing
     if value_handle is not None:
         base['overflow_handle'] = value_handle
         base['overflow_bytes'] = value_bytes
