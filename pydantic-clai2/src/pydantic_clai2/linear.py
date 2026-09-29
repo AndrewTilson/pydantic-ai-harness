@@ -12,6 +12,7 @@ from typing import Literal
 
 from anyio import to_thread
 from fastmcp import Client
+from fastmcp.client.auth import OAuth
 from fastmcp.client.transports import StreamableHttpTransport
 from prompt_toolkit import PromptSession
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
@@ -73,6 +74,7 @@ def activate(host: PluginHost[DepsT]) -> None:
             if args != ['logout']:
                 raise ValueError('Usage: /linear logout')
             await to_thread.run_sync(store.forget)
+            _drop_cached_sign_in(client)
             return 'Signed out of Linear. The next run opens the browser to sign in again.'
 
         host.commands.register(
@@ -267,3 +269,16 @@ def _oauth_client(read_only: bool) -> Client[StreamableHttpTransport]:
         url=str(server.url), auth=oauth(TOKEN_ACCOUNT, server), httpx_client_factory=http_client
     )
     return Client(transport, init_timeout=server.init_timeout())
+
+
+def _drop_cached_sign_in(client: Client[StreamableHttpTransport]) -> None:
+    """Clear the tokens and client registration the live OAuth provider holds in memory.
+
+    Once initialized, the MCP SDK's provider stops reading storage, so deleting the keyring bundle alone would let
+    the next run keep using the cached access and refresh tokens. With both cleared, the next request gets a 401
+    and the provider runs a fresh browser sign-in.
+    """
+    auth = client.transport.auth
+    if isinstance(auth, OAuth):  # pragma: no branch -- `_oauth_client` always passes an `OAuth`
+        auth.context.clear_tokens()
+        auth.context.client_info = None

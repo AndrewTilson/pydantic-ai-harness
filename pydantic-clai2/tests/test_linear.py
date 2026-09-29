@@ -15,6 +15,7 @@ from fastmcp import Client
 from fastmcp.client.auth import OAuth
 from fastmcp.client.transports import StreamableHttpTransport
 from keyring.errors import PasswordDeleteError
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import JsonValue
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
@@ -336,7 +337,14 @@ async def test_oauth_signs_in_with_keyring_tokens(tmp_path: Path, vault: Vault, 
     assert isinstance(transport, StreamableHttpTransport)
     assert transport.url == url
     assert transport.httpx_client_factory is http_client, 'redirects stay off, as for /mcp servers'
-    assert isinstance(transport.auth, OAuth)
+    auth = transport.auth
+    assert isinstance(auth, OAuth)
+    # What an earlier run leaves in memory; the SDK stops reading storage once it has these.
+    auth.context.current_tokens = OAuthToken(access_token='a', refresh_token='r')
+    auth.context.client_info = OAuthClientInformationFull.model_validate(
+        {'client_id': 'c', 'redirect_uris': ['http://127.0.0.1/callback']}
+    )
+    assert auth.context.is_token_valid()
 
     await TokenStore(TOKEN_ACCOUNT).put('x', {'access_token': 'a'}, collection='mcp-oauth-token')
     assert TokenStore(TOKEN_ACCOUNT).signed_in()
@@ -344,6 +352,9 @@ async def test_oauth_signs_in_with_keyring_tokens(tmp_path: Path, vault: Vault, 
         await run(commands, '/linear')
     assert (await run(commands, '/linear logout')).startswith('Signed out of Linear.')
     assert vault == {}
+    assert not auth.context.is_token_valid()
+    assert not auth.context.can_refresh_token(), 'the next run signs in again instead of reusing cached tokens'
+    assert auth.context.client_info is None
 
     await loader.disable('linear')
     assert 'linear' not in {command.name for command in commands}
