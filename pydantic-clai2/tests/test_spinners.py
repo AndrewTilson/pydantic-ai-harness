@@ -27,7 +27,7 @@ from pydantic_clai2.config import Settings
 from pydantic_clai2.field_menu import Runners
 from pydantic_clai2.image_input import ImageInput
 from pydantic_clai2.interrupts import Interrupts
-from pydantic_clai2.live_prompt import LivePrompt
+from pydantic_clai2.live_prompt import LivePrompt, steer_key
 from pydantic_clai2.plugins import PluginHost
 from pydantic_clai2.settings_store import SettingsStore
 from pydantic_clai2.spinner_picker import SpinnerPicker, spinner_command, spinner_completions
@@ -318,7 +318,7 @@ class TestPicker:
         first = Text.from_ansi(picker.preview(item)).plain
         now[0] = 0.1
         second = Text.from_ansi(picker.preview(item)).plain
-        assert 'Working ⠋ | Enter: queue' in first and 'Working ⠙ | Enter: queue' in second
+        assert '─ Working ⠋ ─' in first and '─ Working ⠙ ─' in second
         assert '10 frames at 0.10s per frame' in first and 'working (builtin)' in first
         assert picker.build().highlighted == MenuItem('dots (current)', value='dots')
 
@@ -333,7 +333,7 @@ class TestPicker:
         picker = SpinnerPicker(catalogue(tmp_path), clock=lambda: next(ticks))
         assert picker.build().run().cancelled
         painted = Text.from_ansi(output.getvalue()).plain
-        assert all(f'Working {glyph} |' in painted for glyph in '⠋⠙⠹')
+        assert all(f'Working {glyph} ─' in painted for glyph in '⠋⠙⠹')
 
 
 PLUGIN = """
@@ -411,8 +411,14 @@ async def test_prompt_title_follows_the_selection(width: int) -> None:
         title = live.frame()[0]
         plain = Text.from_ansi(title).plain
         if width == 80:
-            assert plain.startswith(f' Working {BUILTIN_SPINNERS["binary"].frames[0]} | Enter: queue')
-            assert f'{accent}{BUILTIN_SPINNERS["binary"].frames[0]}' in title
+            frame = BUILTIN_SPINNERS['binary'].frames[0]
+            # An empty queue has nothing to steer, so the title carries no queue hints.
+            assert plain.rstrip('─') == f' Working {frame} '
+            assert f'{accent}{frame}' in title
+            live.submit('follow up')
+            follow_up, plain = (Text.from_ansi(row).plain for row in live.frame()[:2])
+            assert follow_up == 'Follow-up: follow up'
+            assert plain.startswith(f' Working {frame} | Enter: queue | {steer_key()}: steer queued ')
         else:
             # Too narrow to show the whole frame: nothing is highlighted rather than half a frame.
             assert plain.startswith(' Working') and accent not in title

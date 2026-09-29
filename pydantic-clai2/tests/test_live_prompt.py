@@ -329,6 +329,7 @@ async def test_working_title_names_the_steer_chord_for_the_platform(
     async with editor() as (live, _, _):
 
         async def operation() -> None:
+            live.submit('follow up')
             assert any(f'| {label}: steer queued' in Text.from_ansi(row).plain for row in live.frame())
 
         assert await live.interrupts.run(operation())

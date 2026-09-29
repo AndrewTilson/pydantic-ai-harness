@@ -14,8 +14,8 @@ Enter submits a prompt when idle and queues a separate follow-up turn when busy.
 To steer instead, queue the message with Enter, then press Alt+Enter
 (Option+Enter on macOS). This sends the oldest queued follow-up to the active
 run at its next opportunity without cancelling in-flight tools or changing your
-draft. While running, the input box shows both shortcuts, named for your
-platform. Shift-Enter inserts a newline; Ctrl-Enter submits like Enter.
+draft. While running with at least one queued message, the input box shows both
+shortcuts, named for your platform. Shift-Enter inserts a newline; Ctrl-Enter submits like Enter.
 
 CLAI requests modified key reporting (xterm `modifyOtherKeys` level 2) while the
 editor is active and releases it for menus and on exit. In iTerm2 this reports
@@ -349,7 +349,9 @@ and cancellation. Unsupported terminals may ignore these changes. Redirected
 output receives no palette-changing sequences. Your terminal configuration file
 is not modified.
 
-The early splash retains its brand colours. Syntax highlighting keeps Monokai;
+The early splash and the `CLAI 2.0` banner keep Pydantic's brand colours under
+every palette, except on 16-colour terminals, where the palette owns the ANSI
+slots. Syntax highlighting keeps Monokai;
 bundled palettes use Termflow's default diff colours. Theme selection adds no
 model requests or telemetry.
 
