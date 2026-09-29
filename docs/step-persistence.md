@@ -406,7 +406,7 @@ URIs are `media+sha256://<hex>`, content-addressed. The same blob written throug
 
 ### Exposing externalized bytes as URLs
 
-Each store accepts a `public_url=` callable that turns the canonical `media+sha256://<hex>` URI into a URL the model can fetch directly.
+Each store accepts a `public_url=` callable that `store.public_url(uri)` uses to turn a canonical `media+sha256://<hex>` URI into a fetchable URL. `StepPersistence` does not call it and does not rewrite persisted message parts into URL parts, so externalized media is restored inline on load. To send the model a URL instead of bytes, call `store.public_url(uri)` yourself and build the URL-based part.
 
 Static base URL (public R2 bucket, CDN):
 
@@ -483,16 +483,13 @@ store = DiskMediaStore('runs', key_strategy=by_media_type)
 
 `DiskMediaStore` rejects strategies that produce absolute paths or paths containing `..` segments, to prevent escaping the store directory.
 
-Separately, all four stores accept a `public_url=` resolver, useful when a CDN, local HTTP server, or signed-URL service fronts the bytes. Without it `public_url(...)` returns `None` (the model never sees a URL unless a resolver is configured and it returns a string).
+Separately, all four stores accept a `public_url=` resolver, useful when a CDN, local HTTP server, or signed-URL service fronts the bytes. Without it `public_url(...)` returns `None`.
 
-pydantic_ai providers transparently download bytes from a URL when the target model does not natively accept that URL type, so emitting a URL is always safe: you only ever lose wire savings, never correctness.
-
-!!! note "The future `MediaExternalizer` capability"
-    When it lands, the composition will be `Agent(capabilities=[MediaExternalizer(store), StepPersistence(...)])` and `StepPersistence` will see already-URL-ified messages, so the externalize walk becomes a no-op. The existing API does not change.
+If you send the model a URL part, Pydantic AI providers download the bytes themselves when the target model does not accept that URL type natively, so a URL part costs wire savings on those models rather than correctness.
 
 ### Persisting to unsupported backends
 
-DynamoDB, Postgres, Redis, GCS, and other backends are out of scope for this release. Write your own `StepStore` (about ten methods on a Protocol) or your own `MediaStore` (five methods: `put`, `get`, `exists`, `public_url`, `get_metadata`) and pass it via `store=` / `media_store=`. Please open an issue if you ship one -- we want to feed the eventual shared adapter layer with N >= 3 real implementations before abstracting.
+DynamoDB, Postgres, Redis, GCS, and other backends are out of scope for this release. Write your own `StepStore` (about ten methods on a Protocol) or your own `MediaStore` (five methods: `put`, `get`, `exists`, `public_url`, `get_metadata`) and pass it via `store=` / `media_store=`.
 
 ## Conversation heads and background names
 
