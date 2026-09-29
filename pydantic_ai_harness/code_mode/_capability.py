@@ -47,7 +47,8 @@ class CodeModeMountSpec(TypedDict):
 
     `MountDir` is a compiled class with no JSON representation of its own, so specs
     describe mounts with this shape and `CodeMode.from_spec` constructs the real
-    `MountDir` instances. Omitted keys keep `MountDir`'s own defaults.
+    `MountDir` instances. Omitted keys keep `MountDir`'s own defaults. An empty list means
+    no mount, since the toolset advertises host file access for any non-`None` mount.
     """
 
     host_path: str
@@ -83,7 +84,7 @@ def _mount_from_spec(mount: CodeModeMountSpec | Sequence[CodeModeMountSpec] | No
                 raise ValueError(f'Unknown mount spec key(s): {sorted(unknown_keys)}')
     validated = _MOUNT_SPEC_ADAPTER.validate_python(mount)
     if isinstance(validated, list):
-        return [MountDir(**entry) for entry in validated]
+        return [MountDir(**entry) for entry in validated] or None
     return MountDir(**validated)
 
 

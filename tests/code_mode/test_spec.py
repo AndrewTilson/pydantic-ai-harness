@@ -105,6 +105,9 @@ class TestFromSpec:
         assert [mount.virtual_path for mount in capability.mount] == ['/a', '/b']
         assert capability.mount[1].write_bytes_limit == 1024
 
+    def test_an_empty_mount_list_means_no_mount(self) -> None:
+        assert CodeMode.from_spec(mount=[]).mount is None
+
     def test_a_mount_missing_a_required_key_fails_validation(self, tmp_path: Path) -> None:
         bad: dict[str, Any] = {'mount': {'host_path': str(tmp_path)}}
         with pytest.raises(ValidationError, match='Field required'):
