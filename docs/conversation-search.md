@@ -1,6 +1,6 @@
 ---
 title: Conversation Search
-description: BM25-search the history StepPersistence already stores -- turns that compaction dropped from the live context, and past runs in the same conversation.
+description: "Let a Pydantic AI agent search its past conversation history, including messages compaction removed from context, with BM25 over Step Persistence snapshots."
 ---
 
 # Conversation Search
@@ -116,6 +116,8 @@ warnings.filterwarnings('ignore', category=HarnessDeprecationWarning)
 | `bm25_b` | `0.75` | BM25 length normalization (Lucene default). |
 | `add_instructions` | `True` | Emit a short note telling the model the recall tool exists. |
 | `tool_id` | `conversation-search` | Toolset id for the search tool. |
+
+Persisted instruction replacements and withdrawals are searchable as system text. Their displayed excerpts are limited to 200 characters; the search index retains the full text.
 
 ## Agent spec (YAML/JSON)
 

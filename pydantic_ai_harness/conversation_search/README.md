@@ -110,6 +110,8 @@ warnings.filterwarnings('ignore', category=HarnessDeprecationWarning)
 | `add_instructions` | `True` | Emit a short note telling the model the recall tool exists. |
 | `tool_id` | `conversation-search` | Toolset id for the search tool. |
 
+Persisted instruction replacements and withdrawals are searchable as system text. Their displayed excerpts are limited to 200 characters; the search index retains the full text.
+
 ## Agent spec (YAML/JSON)
 
 A spec cannot carry a live `HistorySource`, so `ConversationSearch.from_spec` takes a
