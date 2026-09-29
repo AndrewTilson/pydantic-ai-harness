@@ -1,5 +1,6 @@
 """Pure draft editing and history navigation for the pinned prompt."""
 
+from contextlib import suppress
 from dataclasses import dataclass, field
 
 from termflow.ansi.utils import visible_length  # pyright: ignore[reportMissingTypeStubs]
@@ -16,28 +17,67 @@ class PromptBuffer:
     saved_draft: str = ''
     search: str | None = None
     search_original: str = ''
+    _pastes: list[tuple[int, int]] = field(default_factory=list[tuple[int, int]], init=False, repr=False)
+    _entries: list[str] = field(default_factory=list[str], init=False, repr=False)
 
     def replace(self, text: str) -> None:
         """Set a draft and put its cursor at the end."""
         self.text, self.cursor = text, len(text)
+        self._pastes.clear()
 
-    def insert(self, text: str) -> None:
+    def replace_range(self, start: int, end: int, text: str) -> None:
+        """Replace an editing range, revealing overlapping pastes.
+
+        An edit that changes text ends a recall walk, so the edited text becomes the draft the
+        next walk restores. A no-op deletion at either end keeps the walk going.
+        """
+        if text or start != end:
+            self.history_index = None
+        shift = len(text) - (end - start)
+        self._pastes = [
+            (left, right) if right <= start else (left + shift, right + shift)
+            for left, right in self._pastes
+            if right <= start or left >= end
+        ]
+        self.text = self.text[:start] + text + self.text[end:]
+        self.cursor = start + len(text)
+
+    def insert(self, text: str, *, paste: bool = False) -> None:
         """Insert literal text; terminal control bytes do not become escape output."""
         text = text.replace('\r\n', '\n').replace('\r', '\n')
         text = ''.join(char for char in text if char.isprintable() or char in ('\n', '\t'))
-        self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
-        self.cursor += len(text)
-        self.history_index = None
+        start = self.cursor
+        self.replace_range(start, start, text)
+        if paste and (len(text.splitlines()) >= 5 or len(text) >= 1000):
+            self._pastes.append((start, self.cursor))
+            self._pastes.sort()
 
-    def recall(self, *, backwards: bool) -> None:
-        """Walk chronological history, preserving the draft beyond its newest entry."""
+    @property
+    def recall_offset(self) -> int | None:
+        """Steps back from the draft during a recall walk: 0 is the draft, -1 the newest entry."""
+        return None if self.history_index is None else self.history_index - len(self._entries)
+
+    def recall(self, *, backwards: bool, queued: tuple[str, ...] = (), recorded: tuple[str, ...] = ()) -> None:
+        """Walk chronological history, preserving the draft beyond its newest entry.
+
+        `queued` prompts are newer than any history, so a walk that starts here visits them
+        between the draft and history. `recorded` holds the raw history copies made when they
+        were queued; the newest match of each is skipped, so older identical history stays.
+        """
         if self.history_index is None:
             self.saved_draft = self.text
-            self.history_index = len(self.history)
-        self.history_index = min(len(self.history), max(0, self.history_index + (-1 if backwards else 1)))
-        self.replace(self.saved_draft if self.history_index == len(self.history) else self.history[self.history_index])
+            newest_first = self.history[::-1]
+            for text in recorded:
+                with suppress(ValueError):
+                    newest_first.remove(text)
+            self._entries = newest_first[::-1] + list(queued)
+            self.history_index = len(self._entries)
+        self.history_index = min(len(self._entries), max(0, self.history_index + (-1 if backwards else 1)))
+        self.replace(
+            self.saved_draft if self.history_index == len(self._entries) else self._entries[self.history_index]
+        )
 
-    def vertical(self, *, backwards: bool) -> None:
+    def vertical(self, *, backwards: bool, queued: tuple[str, ...] = (), recorded: tuple[str, ...] = ()) -> None:
         """Move within multiline text before falling back to history recall."""
         lines = self.text.split('\n')
         before = self.text[: self.cursor]
@@ -46,7 +86,7 @@ class PromptBuffer:
         if len(lines) > 1 and 0 <= target < len(lines):
             self.cursor = sum(len(line) + 1 for line in lines[:target]) + min(column, len(lines[target]))
         else:
-            self.recall(backwards=backwards)
+            self.recall(backwards=backwards, queued=queued, recorded=recorded)
 
     def search_key(self, key: str) -> None:
         """Search backwards without submitting the selected history entry."""
@@ -65,6 +105,7 @@ class PromptBuffer:
             if matches:
                 index = (matches.index(self.text) + 1) % len(matches) if key == 'ctrl-r' and self.text in matches else 0
                 self.replace(matches[index])
+                self.history_index = None
 
     def edit(self, key: str) -> bool:
         """Apply an editing key; return false when the owner should handle it."""
@@ -81,18 +122,19 @@ class PromptBuffer:
         elif key in ('end', 'ctrl-e'):
             self.cursor += after.find('\n') if '\n' in after else len(after)
         elif key == 'backspace':
-            self.text = before[:-1] + after
-            self.cursor = len(before[:-1])
+            self.replace_range(len(before[:-1]), self.cursor, '')
         elif key == 'delete':
-            self.text = before + after[1:]
+            self.replace_range(self.cursor, min(len(self.text), self.cursor + 1), '')
         elif key in ('ctrl-u', 'ctrl-k', 'ctrl-w', 'alt-backspace'):
             start = 0
             if key in ('ctrl-w', 'alt-backspace'):
                 stripped = before.rstrip()
                 words = stripped.rsplit(maxsplit=1)
                 start = len(stripped) - len(words[-1]) if words else 0
-            self.text = before if key == 'ctrl-k' else before[:start] + after
-            self.cursor = len(before) if key == 'ctrl-k' else min(start, len(self.text))
+            if key == 'ctrl-k':
+                self.replace_range(self.cursor, len(self.text), '')
+            else:
+                self.replace_range(start, self.cursor, '')
         elif key in ('alt-b', 'ctrl-left', 'alt-f', 'ctrl-right'):
             if key in ('alt-b', 'ctrl-left'):
                 self.cursor = len(before.rstrip().rsplit(' ', 1)[0]) + 1 if ' ' in before.rstrip() else 0
@@ -108,15 +150,31 @@ class PromptBuffer:
             return False
         return True
 
+    def display(self) -> tuple[str, int]:
+        """Fold pasted ranges unless the cursor has entered them to edit."""
+        self._pastes = [(start, end) for start, end in self._pastes if not start < self.cursor < end]
+        parts: list[str] = []
+        previous, cursor = 0, self.cursor
+        for start, end in self._pastes:
+            lines = max(1, len(self.text[start:end].splitlines()))
+            label = f'[paste {lines} lines]'
+            parts.extend((self.text[previous:start], label))
+            previous = end
+            if self.cursor >= end:
+                cursor += len(label) - (end - start)
+        parts.append(self.text[previous:])
+        return ''.join(parts), cursor
+
     def rows(self, *, width: int, limit: int) -> list[str]:
         """Wrap into terminal cells and keep the nonblinking cursor in view."""
         width = max(1, width)
         rows = ['']
         cells = 0
         cursor_row = 0
-        for index, char in enumerate(self.text + ' '):
-            is_cursor = index == self.cursor
-            if index == len(self.text) and not is_cursor:
+        text, cursor = self.display()
+        for index, char in enumerate(text + ' '):
+            is_cursor = index == cursor
+            if index == len(text) and not is_cursor:
                 break
             if char == '\n' and not is_cursor:
                 rows.append('')
