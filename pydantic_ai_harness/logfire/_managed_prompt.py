@@ -217,7 +217,7 @@ class ManagedPrompt(AbstractCapability[AgentDepsT]):
         *,
         label: str | None = None,
         targeting_key: str | None = None,
-        attributes: Mapping[str, Any] | None = None,
+        attributes: Mapping[str, object] | None = None,
         render_template: bool = False,
         id: str | None = None,
         description: str | None = None,

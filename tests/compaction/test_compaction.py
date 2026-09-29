@@ -721,8 +721,8 @@ class TestWarnNearLimits:
 
 class TestCompaction:
     def test_spec_schema_publishes_init_fields(self):
-        # Regression for #552: `Model` must stay importable at runtime in the
-        # capability's module so the spec schema can resolve `__init__` annotations.
+        # Regression for #552: every `__init__` annotation, including `event_stream_handler`,
+        # must resolve against the capability's module globals for the schema to publish fields.
         schema = AgentSpec.model_json_schema_with_capabilities([SummarizingCompaction])
         params = schema['$defs']['spec_params_SummarizingCompaction']
         assert set(params['properties']) == {
@@ -730,6 +730,7 @@ class TestCompaction:
             'context_window',
             'defer_loading',
             'description',
+            'event_stream_handler',
             'fallback_context_window',
             'id',
             'incremental',
@@ -745,8 +746,10 @@ class TestCompaction:
             'model_settings',
             'preserve_first_user_message',
             'receipts',
+            'summarization_capabilities',
             'summary_prompt',
             'tokenizer',
+            'tool_return_max_chars',
         }
 
     def test_validation_no_trigger(self):

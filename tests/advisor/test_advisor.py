@@ -486,9 +486,8 @@ class TestAdvisor:
             Advisor('openrouter:anthropic/claude-opus-4.8', mode='native', max_uses=1)
 
     def test_spec_schema_publishes_init_fields(self) -> None:
-        # Regression for #552: core's `ModelSelection` alias resolves against this
-        # capability's module globals, so `Model` and `KnownModelName` must be
-        # importable there at runtime for the schema to publish any fields.
+        # Regression for #552: the schema is built from `from_spec`, whose annotations must
+        # resolve against this module's globals and which leaves out `output_type`.
         schema = AgentSpec.model_json_schema_with_capabilities([Advisor])
         params = schema['$defs']['spec_params_Advisor']
         assert set(params['properties']) == {'model', 'mode', 'max_uses', 'max_tokens', 'caching', 'forward_history'}

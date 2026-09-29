@@ -9,16 +9,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import ModelSelection, NativeOrLocalTool
 from pydantic_ai.exceptions import ModelRetry, UnexpectedModelBehavior, UserError
 from pydantic_ai.messages import ModelResponse
-
-# `KnownModelName` and `Model` back core's `ModelSelection` alias, which is the string
-# `'Model | KnownModelName | str'` evaluated against this module's globals when the
-# agent-spec schema reads `__init__` annotations, so both must be imported at runtime (#552).
-from pydantic_ai.models import (
-    KnownModelName,  # noqa: F401  # pyright: ignore[reportUnusedImport]
-    Model,  # noqa: F401  # pyright: ignore[reportUnusedImport]
-    ModelRequestContext,
-    parse_model_id,
-)
+from pydantic_ai.models import KnownModelName, Model, ModelRequestContext, parse_model_id
 from pydantic_ai.native_tools import AdvisorTool
 from pydantic_ai.output import OutputSpec
 from pydantic_ai.settings import ModelSettings
@@ -213,6 +204,32 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             max_tokens=self.max_tokens,
             caching=self.caching,
             forward_history=self.forward_history,
+        )
+
+    @classmethod
+    def from_spec(
+        cls,
+        # Spelled out rather than `ModelSelection`: core's alias is a string that the agent-spec
+        # schema builder resolves against this module's globals (#552).
+        model: Model | KnownModelName | str,
+        *,
+        mode: Literal['auto', 'native', 'local'] = 'auto',
+        max_uses: int | None = None,
+        max_tokens: int | None = None,
+        caching: Literal['5m', '1h'] | None = None,
+        forward_history: bool = False,
+    ) -> Advisor[AgentDepsT]:
+        """Construct the capability from serializable spec options.
+
+        `output_type` is not spec-serializable, so spec-loaded advisors return plain text.
+        """
+        return cls(
+            model,
+            mode=mode,
+            max_uses=max_uses,
+            max_tokens=max_tokens,
+            caching=caching,
+            forward_history=forward_history,
         )
 
     async def after_model_request(
