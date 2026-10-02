@@ -1,10 +1,10 @@
 # Pydantic AI Harness
 
-> [!WARNING]
-> **This repository is being merged into [Pydantic AI](https://github.com/pydantic/pydantic-ai) and will be archived.**
-> `pydantic-ai-harness` and `pydantic-clai2` are now developed there, in [`src/pydantic_ai_harness`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness) and [`src/pydantic_clai2`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_clai2), with their full history.
-> Please open new issues and pull requests on [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai/issues).
-> The PyPI package names stay the same, and future releases will be published from Pydantic AI.
+> [!NOTE]
+> **Pydantic AI Harness is actively developed and released, now from the [Pydantic AI repository](https://github.com/pydantic/pydantic-ai).**
+> It lives in [`src/pydantic_ai_harness`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness) (and the `clai2` CLI in [`src/pydantic_clai2`](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_clai2)) with its full history, and ships in every [Pydantic AI release](https://github.com/pydantic/pydantic-ai/releases): `pydantic-ai-harness` 0.N alongside `pydantic-ai` 2.N, under the same package name on [PyPI](https://pypi.org/project/pydantic-ai-harness/).
+> Docs: [pydantic.dev/docs/ai/harness](https://pydantic.dev/docs/ai/harness/). Issues and pull requests: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai/issues).
+> This repository keeps the history up to v0.36.0 and is no longer updated.
 
 [![CI](https://github.com/pydantic/pydantic-ai-harness/actions/workflows/main.yml/badge.svg?event=push)](https://github.com/pydantic/pydantic-ai-harness/actions/workflows/main.yml?query=branch%3Amain)
 [![PyPI](https://img.shields.io/pypi/v/pydantic-ai-harness.svg)](https://pypi.python.org/pypi/pydantic-ai-harness)
