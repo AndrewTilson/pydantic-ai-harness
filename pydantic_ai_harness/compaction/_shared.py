@@ -632,7 +632,7 @@ def _is_safe_cutoff(
     return True
 
 
-def find_safe_cutoff(messages: list[ModelMessage], keep: int) -> int:
+def find_safe_cutoff(messages: list[ModelMessage], keep: int, *, search_range: int = _TOOL_PAIR_SEARCH_RANGE) -> int:
     """Find a cutoff index that keeps *keep* tail messages without splitting tool pairs.
 
     Returns 0 if trimming is unnecessary (fewer messages than *keep*).
@@ -644,7 +644,7 @@ def find_safe_cutoff(messages: list[ModelMessage], keep: int) -> int:
 
     target = len(messages) - keep
     for idx in range(target, -1, -1):
-        if _is_safe_cutoff(messages, idx):
+        if _is_safe_cutoff(messages, idx, search_range=search_range):
             return idx
     return 0  # pragma: no cover
 
