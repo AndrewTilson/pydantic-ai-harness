@@ -11,6 +11,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
@@ -92,6 +93,65 @@ class TestMinimumRetention:
         assert sum(part == retained_pin for part in parts) == int(suffix_kind == 'retained_pin')
         assert all(message is not messages[1] for message in result)
 
+    @pytest.mark.parametrize('use_tokenizer', [False, True])
+    @pytest.mark.parametrize(
+        'old_instructions,new_instructions',
+        [
+            ('I' * 100_000, 'I' * 100_000),
+            ('small', 'I' * 100_000),
+            ('I' * 100_000, 'small'),
+            ('I' * 100_000, None),
+        ],
+        ids=['unchanged', 'growing', 'shrinking', 'missing-latest'],
+    )
+    async def test_attached_instructions_do_not_satisfy_floor(
+        self,
+        strategy_type: StrategyType,
+        use_tokenizer: bool,
+        old_instructions: str,
+        new_instructions: str | None,
+    ) -> None:
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart('discard')], instructions=old_instructions),
+            response('x' * 192),
+            ModelRequest(parts=[UserPromptPart('y' * 12)], instructions=new_instructions),
+        ]
+        before = ModelMessagesTypeAdapter.dump_json(messages)
+        suffix = messages[1:]
+        strategy = strategy_type(
+            max_messages=1,
+            min_keep_tokens=200 if use_tokenizer else 50,
+            tokenizer=len if use_tokenizer else None,
+            preserve_first_user_message=False,
+        )
+
+        result = await compact_now(strategy, messages, model=TestModel(custom_output_text='summary'))
+
+        assert_original_suffix(result, suffix, ModelMessagesTypeAdapter.dump_json(suffix))
+        assert ModelMessagesTypeAdapter.dump_json(messages) == before
+        assert all(message is not messages[0] for message in result)
+        assert len(result) == 2 + int(isinstance(strategy, SummarizingCompaction))
+
+    @pytest.mark.parametrize('minimum', [8, 9, 100])
+    @pytest.mark.parametrize('instruction_only', [False, True])
+    async def test_short_history_with_large_instructions_is_noop(
+        self, strategy_type: StrategyType, minimum: int, instruction_only: bool
+    ) -> None:
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[] if instruction_only else [UserPromptPart('tiny')], instructions='I' * 100_000),
+            ModelRequest(parts=[] if instruction_only else [UserPromptPart('tail')], instructions='J' * 200_000),
+        ]
+        before = ModelMessagesTypeAdapter.dump_json(messages)
+        usage = RunUsage()
+        strategy = strategy_type(max_messages=1, min_keep_tokens=minimum, tokenizer=len)
+
+        result = await compact_now(strategy, messages, model=TestModel(), usage=usage)
+
+        assert len(result) == len(messages)
+        assert all(actual is original for actual, original in zip(result, messages))
+        assert ModelMessagesTypeAdapter.dump_json(result) == before
+        assert usage.requests == 0
+
     @pytest.mark.parametrize('scale', [1, 1000])
     async def test_crossing_minimum_retains_whole_message(self, strategy_type: StrategyType, scale: int) -> None:
         # The latest 3k is insufficient; adding the preceding 48k must retain 51k,
@@ -143,13 +203,21 @@ class TestMinimumRetention:
         assert usage.requests == 0
 
     @pytest.mark.parametrize('gap', [0, 7])
-    async def test_tool_return_extends_suffix_back_to_call(self, strategy_type: StrategyType, gap: int) -> None:
+    @pytest.mark.parametrize('reply_kind', ['return', 'tool_retry', 'generic_retry'])
+    async def test_tool_reply_dependencies(self, strategy_type: StrategyType, gap: int, reply_kind: str) -> None:
         call = ModelResponse(parts=[ToolCallPart('lookup', {'key': 'value'}, tool_call_id='lookup-1')])
-        returned = ModelRequest(parts=[ToolReturnPart('lookup', 'result', tool_call_id='lookup-1')])
+        reply = (
+            ToolReturnPart('lookup', 'result', tool_call_id='lookup-1')
+            if reply_kind == 'return'
+            else RetryPromptPart(
+                'retry', tool_name='lookup' if reply_kind == 'tool_retry' else None, tool_call_id='lookup-1'
+            )
+        )
+        returned = ModelRequest(parts=[reply])
         messages: list[ModelMessage] = [response('discard'), call]
         messages.extend(response(f'intervening {index}') for index in range(gap))
         messages.extend([returned, response('end')])
-        suffix = messages[1:]
+        suffix = messages[-2:] if reply_kind == 'generic_retry' else messages[1:]
         snapshot = ModelMessagesTypeAdapter.dump_json(suffix)
         minimum = estimate_token_count(messages[-2:], tokenizer=len)
         strategy = strategy_type(
@@ -162,6 +230,30 @@ class TestMinimumRetention:
         assert all(message is not messages[0] for message in result)
         assert len(result) == len(suffix) + int(isinstance(strategy, SummarizingCompaction))
 
+    @pytest.mark.parametrize('token_budget', [False, True])
+    async def test_legacy_retention_does_not_protect_tool_retries(
+        self, strategy_type: StrategyType, token_budget: bool
+    ) -> None:
+        messages: list[ModelMessage] = [
+            ModelResponse(parts=[ToolCallPart('lookup', {}, tool_call_id='lookup-1')]),
+            ModelRequest(parts=[RetryPromptPart('retry', tool_name='lookup', tool_call_id='lookup-1')]),
+            response('end'),
+        ]
+        suffix = messages[1:]
+        strategy = strategy_type(
+            max_messages=1,
+            keep_messages=2,
+            keep_tokens=estimate_token_count(suffix, tokenizer=len) if token_budget else None,
+            tokenizer=len,
+            preserve_first_user_message=False,
+        )
+
+        result = await compact_now(strategy, messages, model=TestModel(custom_output_text='summary'))
+
+        assert_original_suffix(result, suffix, ModelMessagesTypeAdapter.dump_json(suffix))
+        assert len(result) == 2 + int(isinstance(strategy, SummarizingCompaction))
+        assert all(message is not messages[0] for message in result)
+
     async def test_custom_tokenizer_controls_boundary(self, strategy_type: StrategyType) -> None:
         seen: list[str] = []
 
@@ -169,7 +261,11 @@ class TestMinimumRetention:
             seen.append(text)
             return len(text.split())
 
-        messages: list[ModelMessage] = [response('discard me'), response('two words'), response('longsingleword')]
+        messages: list[ModelMessage] = [
+            response('discard me'),
+            response('two words'),
+            ModelRequest(parts=[UserPromptPart('longsingleword')], instructions='attached instruction ' * 1000),
+        ]
         strategy = strategy_type(
             max_messages=1, min_keep_tokens=3, tokenizer=word_tokens, preserve_first_user_message=False
         )

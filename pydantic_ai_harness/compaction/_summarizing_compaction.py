@@ -387,8 +387,9 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """
 
     min_keep_tokens: int | None = field(default=None, kw_only=True)
-    """Minimum estimated tokens of unchanged, contiguous recent history to retain.
+    """Minimum estimated message-text tokens of unchanged, contiguous recent history to retain.
 
+    Counts message parts, including system prompts, but excludes attached `ModelRequest.instructions`.
     Mutually exclusive with `keep_tokens`; overrides `keep_messages` for suffix selection.
     Includes the whole message crossing the minimum and any earlier tool-call dependencies.
     If history is smaller, retains it all without summarizing. Summaries, receipts, and

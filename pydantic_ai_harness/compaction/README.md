@@ -379,6 +379,11 @@ copied from the older prefix; those copies do not displace the protected suffix.
 Summaries, reinserted older messages, and new receipts are extra. Existing receipts
 inside the protected suffix remain unchanged rather than being deduplicated.
 
+The floor counts retained message-part text, including `SystemPromptPart` content,
+but excludes attached `ModelRequest.instructions`. Large or changing instructions
+cannot satisfy the message-text minimum. Trigger estimates and `keep_tokens`
+counting are unchanged.
+
 Counts use the configured `tokenizer`, or the default character-based estimate,
 not a provider-reported token count. The floor applies to the input of this
 strategy, not to transformations made by other capabilities. Configure the same
